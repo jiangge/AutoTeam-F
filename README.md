@@ -2,9 +2,9 @@
 
 # AutoTeam-F
 
-**面向 ChatGPT Team 的账号轮转与认证同步工具 · Fix + Free 增强版**
+**面向 ChatGPT Team 的账号轮转、免费号生产与认证同步工具 · Fix + Free + Hardening 版**
 
-基于 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 fork，修掉若干阻塞性 bug，新增 **批量生产免费号（Personal）** 能力，改善操作体验。
+基于 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam) 的 fork，修掉若干阻塞性 bug，保留并强化 **批量生产免费号（Personal）** 主路径，同时补齐并行轮转、IPv6、同步目标分发和更好的前端体验。
 
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Playwright](https://img.shields.io/badge/Playwright-Chromium-2EAD33?style=for-the-badge&logo=playwright&logoColor=white)](https://playwright.dev)
@@ -29,34 +29,59 @@
 
 > **免责声明**：本项目仅供学习和研究用途。使用本工具可能违反 OpenAI 的服务条款。使用者需自行承担账号封禁、IP 限制等后果。
 
-> **⚠️ 重要更新（2026-04-30）：免费号自动注册路径当前已被 OpenAI 后端阻断**
->
-> Round 11 真号自验证实：OpenAI 已调整 personal/free workspace 的选择与 plan 下发逻辑。旧路径"邀请进 Team → 主号 kick → personal OAuth → 拿 `plan_type=free`"在 5 次外层重试 + 主动 POST `/api/accounts/workspace/select` + session_token 注入跳过 /log-in 三层加固后**仍无法稳定拿到 free plan**：bundle 总是回落到 `plan_type=team`，`default_workspace_id` 也不再切回 Personal。
->
-> 影响：下表标 🆕 的 **🆓 生产免费号（Personal）** 整条链路当前**事实失效**，点击"生成免费号"会跑完整套流程但最终 5 次全部 plan_drift，账号被标 STANDBY 留池（无 token 损失）。**Team 子号注册 / 轮转 / 巡检 / OAuth 等其他全部能力不受影响。**
->
-> 底层钩子保留：`oauth_workspace.py` / `_run_post_register_oauth` 5 次重试 + session_token 注入 + plan_drift 累计的代码全部留底，等 OpenAI 再次调整或社区给出新绕过路径时直接复用。详见 `CHANGELOG.md` 与 `prompts/0426/verify/round11-review-report.md`。
+> **当前状态（2026-05-17）**：免费号自动注册路径仍然保留，并且是当前实现的主路径之一。Web 面板里的「生成免费号」和 API `POST /api/tasks/fill { target: N, leave_workspace: true }` 会走 `注册 → 主号踢出 → personal OAuth → free plan 校验 → 认证文件落盘 → 同步目标` 这一链路。与上游相比，本 fork 不再把 Personal/free 当成临时旁路，而是把它和 Team 轮转、同步和前端操作统一进同一套状态机。
 
 ## 特性
 
 | | 功能 | 描述 |
 |---|---|---|
-| 📧 | **自动注册** | 临时邮箱(`cf_temp_email` 或 `maillab` 双后端,SetupPage 4 步状态机指引切换 + 协议指纹嗅探防错配)+ Playwright 自动注册 |
-| 🆓 | **生产免费号** 🆕 ⚠️暂不可用 | 批量注册 → 主号踢出 → Personal OAuth，一条龙（**2026-04-30 起被 OpenAI workspace 路径变更阻断**，详见上方警告） |
+| 📧 | **自动注册** | 临时邮箱(`cf_temp_email` / `maillab` / 兼容后端) + Playwright 自动注册，SetupPage 4 步状态机指引切换并做协议指纹嗅探 |
+| 🆓 | **生产免费号** 🆕 | 批量注册 → 主号踢出 → Personal OAuth，一条龙（当前仍是主路径） |
 | 🔐 | **Codex OAuth** | 自动登录 Codex，Team / Personal 双模式 |
 | 🔑 | **手动 OAuth 导入** | localhost 自动回调，失败可手动粘贴 |
-| 🔄 | **智能轮转** | 额度不足自动移出，旧号恢复后优先复用 |
-| ☁️ | **CPA 双向同步** | 本地 active 上传到 CPA，也可反向导入 |
-| 🖥️ | **Web 面板** | 仪表盘、同步中心、OAuth 登录、任务历史、日志、设置 |
+| 🔄 | **智能轮转** | 额度不足自动移出，旧号恢复后优先复用，并支持更安全的先踢人再换人策略 |
+| ⚙️ | **并行轮转** | 复用 standby、探测与同步并行化，默认保守但可开并发 |
+| 🌐 | **IPv6 出口** | 独立 IPv6 pool / proxy，按账号分配出口 |
+| ☁️ | **统一同步** | 本地 active 可同步到 CPA / Sub2API，主号也有独立同步路径 |
+| 🖥️ | **Web 面板** | 仪表盘、同步中心、OAuth 登录、任务历史、日志、设置、实时进度 |
 | 🛑 | **软停止任务** 🆕 | 随时中止跑到一半的批次，协作式退出不留半成品 |
 | 📊 | **失败分类** 🆕 | `register_failures.json` 持久化各类失败（手机号/重复/踢人/OAuth 等） |
 | 🔧 | **自诊断** 🆕 | `/api/admin/diagnose` + `/api/admin/fix-account-id` 一键定位 401 |
 | 🗑️ | **批量删除** 🆕 | Web 面板多选 + 一次性 kick + 删邮箱 + sync CPA |
+| 🛡️ | **运行时硬化** 🆕 | Playwright guard、浏览器清理、Docker 自检、资源探针、版本指纹 |
+| ✨ | **更好的前端** 🆕 | Dashboard / Pool / Sync / Tasks / Logs / Settings 全面重构，实时性、信息密度和可读性提升 |
 | 🔍 | **自动巡检** | 后台定时检查额度并触发轮转 |
 | 📤 | **导出认证** | 一键导出 Codex CLI 格式 auth.json |
 | 🐳 | **Docker** | 支持容器部署与数据持久化 |
 
 > 🆕 = 相对原仓库新增。其余承袭自 [cnitlrt/AutoTeam](https://github.com/cnitlrt/AutoTeam)。
+
+## 与上游 `cnitlrt/AutoTeam` 的功能差异
+
+> 下表按能力域汇总当前 fork 与上游的实际差异，重点覆盖你关心的免费号主路径、安全轮换、并行、IPv6、更安全的指纹、同步目标分发和前端重构。不是逐文件罗列，但已经把当前 README 应该交代的功能差覆盖到位。
+
+| 能力域 | 上游 `cnitlrt/AutoTeam` | AutoTeam-F 当前实现 | 备注 |
+|---|---|---|---|
+| 免费号自动注册（Personal） | 只把自动注册描述成 Team 方向的能力，没有把 Personal/free 生产作为当前主路径展开 | 仍保留并可直接走：注册 → Team 邀请 → 主号踢出 / leave_workspace → personal OAuth → free plan 校验 → auth 文件落盘 | 当前主路径 |
+| Team 子号自动注册 | 基础 Team 注册与 OAuth | 加入 add-phone 检测、workspace 选择、session_token 注入、plan 白名单、失败留池和重试退避 | 主路径更稳 |
+| 安全轮换 | 常规按额度轮转 | 先踢人再换人、对账先清异常再补位，减少席位冲突和残留 | 轮换安全性更高 |
+| 并行能力 | 以串行为主 | `ROTATE_CONCURRENCY`、并发 standby 复用、并发被踢探测、Sub2API 并发同步 | 默认保守，可开 |
+| 预测式替换 | 无 | `PREDICTIVE_ENABLED` + `QuotaPredictor`，在预计耗尽前抢先换出 | 提前释放席位 |
+| 账号状态机 | 状态较少 | 扩展为 `active / exhausted / standby / pending / personal / auth_invalid / orphan / disabled`，并落 `seat_type`、`workspace_account_id` 等字段 | 支持更细粒度运维 |
+| 对账与异常清理 | 基础同步 / 清理 | `reconcile` 识别残废、错位、耗尽未抛弃、ghost、over-cap，支持 dry-run | 自动修复更完整 |
+| 主号健康门 | 无统一健康闸 | `master_health` / grace / cancelled / unhealthy 门禁，personal/team 入口都先校验 | 避免错路由 |
+| 邮箱后端 | `CloudMail` / `Cloudflare Temp Email` 简单切换 | provider 抽象层 + `maillab` / `cf_temp_email` / `addy.io` / `simplelogin` + 路由探测 | 兼容更多后端 |
+| 邮箱归属验证 | 基础连通性校验 | 4 步状态机：provider → 连接 → 域名归属 → 保存 | 误配更早暴露 |
+| 远端同步 | 仅 CPA 基线同步 | `sync_targets` 统一分发，支持 CPA + Sub2API + 主号同步，新增目标级配置、优先级、并发、白名单、WS 模式、自动暂停 | 不再只有单同步点 |
+| 主号 Codex 同步 | 基本导出 | 主号同步、session token fallback、动态目标文案、目标层统一接入 | 对主号更友好 |
+| IPv6 | 无专门出口池 | `ipv6_pool` / `ipv6_proxy`，按账号分配独立 IPv6 出口 | 适配更细 |
+| 运行时 / Playwright | 基础自动化 | `_playwright_guard`、browser cleanup、资源探针、Docker self-check、浏览器 zombie 监测、版本指纹 | 更稳、更可观测 |
+| Docker / 部署 | 基础 compose | entrypoint 自检、镜像 revision / build time、`/api/version`、部署与重建 SOP、资源边界守卫 | 更容易排障 |
+| 前端 | 基础面板 | Dashboard / Pool / Sync / Settings / Tasks / Logs / Setup 全面重构，实时状态、SSE 进度、Toast、健康卡片、批量操作 | 体验和响应更好 |
+| 运维 API | 基础 API | 新增 / 增强 `/api/admin/reconcile`、`/api/admin/diagnose`、`/api/admin/fix-account-id`、`/api/accounts/{email}/probe`、`/api/version`、`/api/tasks/check include_standby` | 运维能力更全 |
+| 失败与日志 | 单次报错为主 | `register_failures.json` 持久化失败分类，实时任务历史 / 日志面板 | 便于回溯 |
+| 多 workspace 池 | 无 | `workspace_pool` + 自动 failover + Team 池资源调度 | 适合更大规模 |
+| 账号禁用 | 无本地禁用态 | `disabled` 本地禁用字段，禁用账号自动跳过轮转 / 同步 | 便于人工管控 |
 
 **首次使用建议直接看**：[从零开始部署教程](docs/getting-started.md)
 
@@ -117,7 +142,7 @@ Linux + Docker 访问宿主机服务，详见 [Docker 部署文档](docs/docker.
 | `manual-add` | 手动 OAuth 添加账号 |
 | `fill [N]` | 补满成员（Team 模式） |
 | `cleanup [N]` | 清理多余成员 |
-| `sync` | 同步认证文件到 CPA |
+| `sync` | 同步认证文件到 CPA / Sub2API |
 | `pull-cpa` | 从 CPA 反向同步认证文件到本地 |
 | `admin-login` | 管理员登录 |
 
@@ -132,11 +157,11 @@ Linux + Docker 访问宿主机服务，详见 [Docker 部署文档](docs/docker.
 | 📊 仪表盘 | 账号统计 + 状态表格 + 登录/移出/删除/**批量删除** 🆕 |
 | 👥 Team 成员 | 全部 Team 成员（含外部成员） |
 | 🔁 账号池操作 | 轮转 / 检查 / 补满 / 添加 / **生成免费号** 🆕 / 清理 |
-| 🔄 同步中心 | 同步账号、同步 CPA、拉取 CPA |
+| 🔄 同步中心 | 同步账号、同步 CPA / Sub2API、拉取 CPA |
 | 🔐 OAuth 登录 | 生成认证链接；localhost 自动回调 + 手动粘贴兜底 |
 | 📜 任务历史 | 后台任务执行状态 + **实时停止** 🆕 |
 | 📋 日志 | 实时日志查看器 |
-| ⚙️ 设置 | 管理员登录 + 主号 Codex 同步 + 巡检配置 |
+| ⚙️ 设置 | 管理员登录 + 主号 Codex 同步 + 巡检 / 轮转 / 同步目标配置 |
 
 ## 修复了什么
 
@@ -181,10 +206,11 @@ curl -s -X POST -H "Authorization: Bearer $KEY" http://localhost:8787/api/admin/
 
 ## 已知限制
 
-- **IP 风险** — VPS 的 IP 容易被 OpenAI/Cloudflare 标记，建议使用住宅代理
-- **并发限制** — 同一时间只允许一个 Playwright 操作
+- **IP 风险** — VPS 的 IP 容易被 OpenAI / Cloudflare 标记，建议使用住宅代理
+- **并发边界** — 默认仍以保守串行为主；开启并发后，Playwright 浏览器上下文共享仍需要遵守线程安全边界
 - **验证码** — OpenAI 验证码有效期短，网络延迟可能导致过期
 - **软停止 ≠ 硬停止** — 点"停止任务"后，当前账号注册（~2 分钟）会跑完再退出，不中途打断浏览器
+- **平台策略变化** — 免费号路径依赖母号健康、workspace 选择和 OpenAI 后端策略；如果 plan drift / add-phone / workspace 规则变化，可能会 fail-fast 留池
 - **Team 席位上限** — 免费号生产时，baseline + 本批新号 ≤ 4，超过会自动缩批
 
 更多详见 [常见问题](docs/troubleshooting.md)
