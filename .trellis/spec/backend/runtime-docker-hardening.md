@@ -182,7 +182,7 @@ Use `require_browser=True` for any path that depends on a real browser context. 
 - `build_multi_master_status(accounts=None, pool=None) -> dict`
 - `resolve_worker_budget(owner_count, *, requested_owner_workers=None, requested_direct_parallel=None, runtime_snapshot=None) -> dict`
 - `run_multi_master_fill(target_seats=3, *, owner_workers=None, direct_parallel=None, workspace_ids=None, dry_run=False, post_sync=True, pool=None, worker=None) -> dict`
-- `cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=True)`
+- `cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=True, direct_parallel=None)`
 - `POST /api/tasks/multi-master/fill`
 
 ### 3. Contracts
@@ -193,8 +193,8 @@ Use `require_browser=True` for any path that depends on a real browser context. 
 - Per-owner workers must use `temporary_admin_state(...)` so `ChatGPTTeamAPI.start()` reads the owner-local session/account/workspace data without mutating global `state.json`.
 - Owner worker failures are isolated. One failed owner becomes one failed result row and must not prevent other submitted owners from completing.
 - `session_token` may be persisted in the local workspace pool for imported owners, but API status and task results must expose only `session_present`, never the raw token.
-- `MULTI_MASTER_MAX_OWNER_WORKERS`, `MULTI_MASTER_BROWSER_BUDGET`, `MULTI_MASTER_MEMORY_DOWNGRADE_RATIO`, and `DIRECT_REGISTER_PARALLEL` are the scheduling budget inputs. The effective direct-registration race is a budget value until the direct-signup race is explicitly wired into `manager.py`; do not claim single-account race behavior from the scheduler alone.
-- When owner workers call `cmd_fill`, they must set `post_sync=False` and `print_status=False`. The parent multi-master task may run CPA sync once after all owners finish; a post-sync failure should be reported in `post_sync` without converting completed owner work into failed owner work.
+- `MULTI_MASTER_MAX_OWNER_WORKERS`, `MULTI_MASTER_BROWSER_BUDGET`, `MULTI_MASTER_MEMORY_DOWNGRADE_RATIO`, and `DIRECT_REGISTER_PARALLEL` are the scheduling budget inputs. `run_multi_master_fill()` must pass the resolved `direct_register_parallel` into `cmd_fill(..., direct_parallel=...)`, and `cmd_fill()` must pass it into `create_new_account(..., parallel=...)`.
+- When owner workers call `cmd_fill`, they must set `post_sync=False`, `print_status=False`, and the budgeted `direct_parallel` value. The parent multi-master task may run CPA sync once after all owners finish; a post-sync failure should be reported in `post_sync` without converting completed owner work into failed owner work.
 - `/api/status.multi_master` is additive. It must not remove or rename existing status fields and must not raise a 500 if multi-master diagnostics fail.
 
 ### 4. Validation & Error Matrix
@@ -206,6 +206,7 @@ Use `require_browser=True` for any path that depends on a real browser context. 
 | Owner row has no session token | Mark it non-runnable in status; execution may fail only that owner |
 | Runtime memory ratio >= `MULTI_MASTER_MEMORY_DOWNGRADE_RATIO` | Force `owner_workers=1` and `direct_register_parallel=1` with reason `memory_high` |
 | `owner_workers * direct_register_parallel` exceeds `MULTI_MASTER_BROWSER_BUDGET` | Clip both values to stay within the global browser budget |
+| Owner worker starts `cmd_fill` | Pass the resolved `direct_parallel`; do not leave it as display-only metadata |
 | One owner worker raises | Record `last_error` for that workspace and return overall `partial_failed` when other owners complete |
 | All owner workers raise | Return overall `failed` |
 | Parent post-sync raises | Return `post_sync.ok=false`; keep per-owner results intact |
@@ -214,6 +215,7 @@ Use `require_browser=True` for any path that depends on a real browser context. 
 ### 5. Good/Base/Bad Cases
 
 - Good: two imported owners marked `parallel=true` are filled inside one `multi-master-fill` task, each owner uses its own temporary admin state, and final `post_sync` runs once.
+- Good: a multi-master dry-run/result reports the same `direct_register_parallel` that execution passes into `cmd_fill`.
 - Base: a single-owner install with no parallel rows still reports compatible status and can dry-run against the active workspace.
 - Bad: increasing `target` above `3` to gain throughput, because this breaks the Team-seat contract.
 - Bad: calling `cmd_fill()` concurrently with its default `post_sync=True`, because each worker would race remote CPA sync and make delete-guard behavior harder to reason about.
@@ -226,7 +228,7 @@ Use `require_browser=True` for any path that depends on a real browser context. 
   - `WorkspacePool.upsert` persists owner metadata and keeps the active-workspace invariant.
   - `build_multi_master_status` groups accounts by `workspace_account_id` and omits session tokens.
   - `resolve_worker_budget` downgrades on high memory and clips by browser budget.
-  - `run_multi_master_fill` isolates owner failures, records `last_error`, suppresses worker-local sync/status, and reports parent `post_sync`.
+  - `run_multi_master_fill` isolates owner failures, records `last_error`, suppresses worker-local sync/status, passes `direct_parallel` into `cmd_fill`, and reports parent `post_sync`.
   - API dry-run returns a plan and passes request parameters through.
 - Existing single-owner regressions must still pass:
   - `tests/unit/test_round12_s7_workspace_pool.py`

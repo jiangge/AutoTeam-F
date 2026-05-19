@@ -240,7 +240,13 @@ def _run_fill_for_owner(owner: dict[str, Any], target_seats: int, direct_paralle
         account_id=owner.get("account_id") or "",
         workspace_name=owner.get("workspace_name") or "",
     ):
-        cmd_fill(target_seats, leave_workspace=False, post_sync=False, print_status=False)
+        cmd_fill(
+            target_seats,
+            leave_workspace=False,
+            post_sync=False,
+            print_status=False,
+            direct_parallel=direct_parallel,
+        )
     return {
         "workspace_id": owner.get("id"),
         "admin_email": owner.get("admin_email"),

@@ -249,6 +249,48 @@ def test_auto_check_cooldown_keeps_full_team_from_refilling(tmp_path, monkeypatc
     assert started == []
 
 
+def test_auto_check_cooldown_allows_full_team_blocker_replacement(monkeypatch):
+    started = []
+
+    def fake_start_task(command, func, params, *args, **kwargs):
+        started.append((command, params, args, kwargs))
+
+    monkeypatch.setattr(api, "_auto_fill_last_trigger_ts", time.time())
+    monkeypatch.setattr(api, "_auto_check_config", {"interval": 0, "target_seats": 3, "threshold": 10, "min_low": 1})
+    monkeypatch.setattr(api, "log_runtime_resource_snapshot", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "_is_main_account_email", lambda _email: False)
+    monkeypatch.setattr(api, "_auto_check_team_member_count", lambda *args, **kwargs: 3)
+    monkeypatch.setattr(api, "_start_task", fake_start_task)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {"email": "healthy@example.com", "status": "active", "auth_file": ""},
+            {"email": "blocked@example.com", "status": "auth_invalid", "auth_file": ""},
+        ],
+    )
+
+    stop_event = threading.Event()
+    restart_event = threading.Event()
+    wait_calls = {"count": 0}
+
+    def fake_wait(_seconds):
+        wait_calls["count"] += 1
+        return wait_calls["count"] > 1
+
+    monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(api, "_auto_check_stop", stop_event)
+    monkeypatch.setattr(api, "_auto_check_restart", restart_event)
+
+    api._auto_check_loop()
+
+    assert len(started) == 1
+    command, params, args, kwargs = started[0]
+    assert command == "auto-fill"
+    assert params == {"target_seats": 3}
+    assert args == (3,)
+    assert kwargs == {"background_post_sync": True}
+
+
 def test_sanitize_account_keeps_exportable_main_account_active_without_live_quota(tmp_path, monkeypatch):
     main_email = "owner@example.com"
     auth_file = tmp_path / "codex-main.json"

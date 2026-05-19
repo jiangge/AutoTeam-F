@@ -242,7 +242,7 @@ def test_reconcile_dry_run_includes_over_cap_predictions(tmp_path, monkeypatch):
     """HIGH-1:dry_run 必须**预测**第二轮 over-cap 受害者填进 over_cap_kicked,
     但不能 GET /users 第二次,也不能调 remove_from_team / update_account。
     """
-    # 5 子号 + 1 主号 → 超员 1
+    # 5 子号 + 1 主号；当前硬约束为 1 母 + 2 子，因此超员 3。
     auth_ok = tmp_path / "codex-good@example.com-team-1.json"
     auth_ok.write_text("{}", encoding="utf-8")
 
@@ -287,11 +287,11 @@ def test_reconcile_dry_run_includes_over_cap_predictions(tmp_path, monkeypatch):
     user_get_calls = [c for c in fetch_calls if c[0] == "GET" and c[1].endswith("/users")]
     assert len(user_get_calls) == 1, f"dry_run should not refetch /users, got {fetch_calls}"
 
-    # 必须有 1 个 over_cap_kicked 预测项
-    assert len(result["over_cap_kicked"]) == 1, f"expected 1 prediction, got {result['over_cap_kicked']}"
+    # 必须预测踢到 2 个子号硬上限以内。
+    assert len(result["over_cap_kicked"]) == 3, f"expected 3 predictions, got {result['over_cap_kicked']}"
     # 受害者按 _priority 升序,active 按 p_remain (100-primary_pct) 升序 → primary_pct 最高的先 kick
     # u5 primary_pct=50 → p_remain=50 是最低 remain → 第一个被 kick
-    assert result["over_cap_kicked"] == ["u5@example.com"]
+    assert result["over_cap_kicked"] == ["u5@example.com", "u4@example.com", "u3@example.com"]
 
 
 def test_reconcile_priority_keeps_ghost_when_kick_disabled(tmp_path, monkeypatch):
@@ -301,7 +301,7 @@ def test_reconcile_priority_keeps_ghost_when_kick_disabled(tmp_path, monkeypatch
     auth_ok = tmp_path / "codex-keep@example.com-team-1.json"
     auth_ok.write_text("{}", encoding="utf-8")
 
-    # 4 个 active 账号 + 1 个 ghost(本地无记录) = 5,超员 1
+    # 4 个 active 账号 + 1 个 ghost(本地无记录) = 5；ghost 保留时需从本地 active 中踢 3 个。
     accounts = [
         {
             "email": f"u{i}@example.com",
@@ -343,13 +343,13 @@ def test_reconcile_priority_keeps_ghost_when_kick_disabled(tmp_path, monkeypatch
     assert "ghost-extra@example.com" in result["ghost_seen"]
     assert "ghost-extra@example.com" not in result["ghost_kicked"]
 
-    # 第二轮 over-cap 1 个:必须挑 u1-u4 中的一个 active(p_remain=50, priority=(5,50))
+    # 第二轮 over-cap:必须挑 u1-u4 中的 active(p_remain=50, priority=(5,50))
     # 而不是 ghost-extra(被强制排到 (99, 0) 末尾)
     assert "ghost-extra@example.com" not in result["over_cap_kicked"], (
         f"ghost must not be over-cap kicked when RECONCILE_KICK_GHOST=False: {result['over_cap_kicked']}"
     )
-    assert len(result["over_cap_kicked"]) == 1
-    assert result["over_cap_kicked"][0] in {f"u{i}@example.com" for i in range(1, 5)}
+    assert len(result["over_cap_kicked"]) == 3
+    assert set(result["over_cap_kicked"]).issubset({f"u{i}@example.com" for i in range(1, 5)})
 
 
 def test_reconcile_find_team_auth_file_rejects_personal_plan(tmp_path, monkeypatch):

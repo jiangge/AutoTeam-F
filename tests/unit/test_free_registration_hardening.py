@@ -226,6 +226,81 @@ def test_create_account_direct_reuses_signup_profile_for_register_and_oauth(monk
     assert captured["oauth"]["leave_workspace"] is True
 
 
+def test_create_account_direct_races_signup_workers_and_uses_winner(monkeypatch):
+    calls = []
+    added = []
+    out = {}
+
+    class _RaceMailClient:
+        counter = 0
+        provider_name = "race"
+
+        def __init__(self):
+            type(self).counter += 1
+            self.idx = type(self).counter
+
+        def login(self):
+            return None
+
+        def create_temp_email(self):
+            return f"mail-{self.idx}", f"user-{self.idx}@example.com"
+
+        def delete_account(self, *_args, **_kwargs):
+            return None
+
+    def fake_register_once(_mail_client, email, password, *, cloudmail_account_id=None, signup_profile=None):
+        calls.append(
+            {
+                "email": email,
+                "password": password,
+                "cloudmail_account_id": cloudmail_account_id,
+                "signup_profile": signup_profile,
+            }
+        )
+        return email == "user-2@example.com", f"token-for-{email}"
+
+    monkeypatch.setattr(manager_mod, "_ensure_account_ipv6_proxy", lambda _email: ("", ""))
+    monkeypatch.setattr(manager_mod, "_release_account_ipv6_proxy", lambda _email: None)
+    monkeypatch.setattr(manager_mod, "_register_direct_once", fake_register_once)
+    monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda _email: False)
+    monkeypatch.setattr(manager_mod, "time", manager_mod.time)
+    monkeypatch.setattr(manager_mod.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager_mod, "add_account", lambda *args, **kwargs: added.append((args, kwargs)))
+    monkeypatch.setattr(manager_mod, "get_chatgpt_account_id", lambda: "workspace-account")
+    monkeypatch.setattr(
+        manager_mod,
+        "_run_post_register_oauth",
+        lambda email, *_args, **_kwargs: email,
+    )
+
+    result = manager_mod.create_account_direct(
+        mail_client=_RaceMailClient(),
+        out_outcome=out,
+        parallel=3,
+    )
+
+    assert result == "user-2@example.com"
+    assert sorted({call["email"] for call in calls}) == [
+        "user-1@example.com",
+        "user-2@example.com",
+        "user-3@example.com",
+    ]
+    assert sum(1 for call in calls if call["email"] == "user-2@example.com") == 1
+    assert added[0][0][0] == "user-2@example.com"
+    assert out["direct_register_parallel"] == 3
+    assert out["direct_register_failures"] == 2
+
+
+def test_direct_register_parallel_downgrades_when_memory_high(monkeypatch):
+    monkeypatch.setenv("AUTOTEAM_REGISTER_PARALLEL_MEMORY_WARN_RATIO", "0.70")
+    monkeypatch.setattr(
+        "autoteam.runtime_resources.collect_runtime_resource_snapshot",
+        lambda: {"cgroup_memory_usage_ratio": 0.95, "browser_process_live": 0},
+    )
+
+    assert manager_mod._cap_direct_register_parallel(4) == 1
+
+
 def test_run_post_register_oauth_passes_signup_profile_to_team_oauth(monkeypatch):
     profile = SignupProfile(
         full_name="Mia Wilson",

@@ -22,10 +22,13 @@ class _FakeMailClient:
 
 
 def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch):
+    import autoteam.config as config
+
     chatgpt = _FakeChatGPT()
     count_values = iter([2, 3])
     events = []
 
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
@@ -63,10 +66,13 @@ def test_cmd_fill_tries_other_reusable_accounts_before_creating_new(monkeypatch)
 
 
 def test_cmd_fill_skips_google_accounts_during_auto_reuse(monkeypatch):
+    import autoteam.config as config
+
     chatgpt = _FakeChatGPT()
     count_values = iter([2, 3])
     events = []
 
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", False)
     monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
     monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
     monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(count_values))
@@ -109,3 +115,41 @@ def test_auto_reuse_skip_reason_detects_google_provider_and_gmail():
         == "Google 登录账号暂不支持自动复用"
     )
     assert manager._auto_reuse_skip_reason({"email": "user@example.com"}) is None
+
+
+def test_cmd_fill_passes_direct_parallel_and_releases_failed_validation(monkeypatch):
+    import autoteam.config as config
+
+    chatgpt = _FakeChatGPT()
+    counts = iter([2, 2])
+    events = []
+
+    monkeypatch.setattr(config, "ROTATE_SKIP_REUSE", True)
+    monkeypatch.setattr(manager, "ChatGPTTeamAPI", lambda: chatgpt)
+    monkeypatch.setattr(manager, "CloudMailClient", lambda: _FakeMailClient())
+    monkeypatch.setattr(manager, "get_team_member_count", lambda _chatgpt: next(counts))
+    monkeypatch.setattr(manager, "get_standby_accounts", lambda: [])
+    monkeypatch.setattr(
+        manager,
+        "create_new_account",
+        lambda _chatgpt, _mail, *, parallel=None: events.append(("create", parallel)) or "new@example.com",
+    )
+    monkeypatch.setattr(manager, "_validate_managed_account_operational", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        manager,
+        "remove_from_team",
+        lambda _chatgpt, email, *, return_status=False, **_kwargs: events.append(("remove", email)) or "removed",
+    )
+    monkeypatch.setattr(
+        manager,
+        "update_account",
+        lambda email, **kwargs: events.append(("update", email, kwargs.get("status"), kwargs.get("_reason"))),
+    )
+    monkeypatch.setattr(manager, "sync_to_cpa", lambda: events.append(("sync", None)))
+    monkeypatch.setattr(manager, "cmd_status", lambda: events.append(("status", None)))
+
+    manager.cmd_fill(target=3, direct_parallel=3)
+
+    assert ("create", 3) in events
+    assert ("remove", "new@example.com") in events
+    assert ("update", "new@example.com", manager.STATUS_STANDBY, "fill_new_account_not_ready") in events

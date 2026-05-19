@@ -106,6 +106,10 @@ SUB2API_OVERWRITE_ACCOUNT_SETTINGS = _get_bool_env("SUB2API_OVERWRITE_ACCOUNT_SE
 AUTO_CHECK_RETRY_ADD_PHONE = _get_bool_env("AUTO_CHECK_RETRY_ADD_PHONE", True)
 AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", 3)
 
+# 默认不复用旧/失败/退役子号。Team 满员需要替换时必须先移出旧 child，再创建新 child。
+ROTATE_SKIP_REUSE = _get_bool_env("ROTATE_SKIP_REUSE", True)
+ROTATE_MAX_DURATION = max(60, _get_int_env("ROTATE_MAX_DURATION", 1500))
+
 
 # Round 12 S5 — 预测式抢先替换配置.
 # PREDICTIVE_ENABLED=false(默认 安全): cmd_rotate 不做预测式 preempt,

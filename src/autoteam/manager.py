@@ -42,6 +42,7 @@ from autoteam.accounts import (
     delete_account,
     find_account,
     get_standby_accounts,
+    is_account_disabled,
     is_supported_plan,
     load_accounts,
     save_accounts,
@@ -349,12 +350,81 @@ def _count_pool_active_accounts(accounts: list[dict] | None = None, *, require_a
     accounts = accounts if accounts is not None else load_accounts()
     count = 0
     for acc in accounts:
-        if _is_main_account_email(acc.get("email")) or acc.get("status") != STATUS_ACTIVE:
-            continue
-        if require_auth and not _has_auth_file(acc):
+        if require_auth:
+            if not _is_pool_active_account_usable(acc, require_auth=True):
+                continue
+        elif _is_main_account_email(acc.get("email")) or is_account_disabled(acc) or acc.get("status") != STATUS_ACTIVE:
             continue
         count += 1
     return count
+
+
+def _account_auth_state_blocks_pool_use(acc: dict | None, *, now: float | None = None) -> bool:
+    """Return True when saved Codex auth is known or likely unusable."""
+    acc = acc or {}
+    if acc.get("auth_retry_paused"):
+        return True
+    if acc.get("auth_last_error"):
+        return True
+    retry_after = acc.get("auth_retry_after")
+    if retry_after:
+        try:
+            return float(retry_after) > (time.time() if now is None else now)
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _is_pool_active_account_usable(acc: dict | None, *, require_auth: bool = True) -> bool:
+    """Check whether a child account should count as an actually usable pool seat."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+        return False
+    if acc.get("status") != STATUS_ACTIVE:
+        return False
+    if require_auth and not _has_auth_file(acc):
+        return False
+    if require_auth and _account_auth_state_blocks_pool_use(acc):
+        return False
+    return True
+
+
+def _replaceable_pool_blocker_reason(acc: dict | None, *, missing_auth: bool = False) -> str | None:
+    """Return the concrete reason a child seat blocks the usable pool but may be replaced."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
+        return None
+    if _is_protected_local_credential_seat(acc):
+        return None
+    status = acc.get("status")
+    if status == STATUS_EXHAUSTED:
+        return "quota_exhausted"
+    if status == STATUS_AUTH_INVALID:
+        return "auth_invalid"
+    if status == STATUS_ORPHAN:
+        return "orphan"
+    if status != STATUS_ACTIVE:
+        return None
+    if missing_auth:
+        return "auth_error"
+    if not _has_auth_file(acc):
+        return "missing_auth"
+    if acc.get("auth_retry_paused"):
+        return "auth_retry_paused"
+    if acc.get("auth_last_error"):
+        return "auth_error"
+    retry_after = acc.get("auth_retry_after")
+    if retry_after:
+        try:
+            if float(retry_after) > time.time():
+                return "auth_retry_after"
+        except (TypeError, ValueError):
+            return "auth_retry_after_invalid"
+    return None
+
+
+def _is_replaceable_pool_blocker(acc: dict | None, *, missing_auth: bool = False) -> bool:
+    return _replaceable_pool_blocker_reason(acc, missing_auth=missing_auth) is not None
 
 
 def _count_local_team_seat_accounts(accounts: list[dict] | None = None) -> int:
@@ -368,7 +438,9 @@ def _count_local_team_seat_accounts(accounts: list[dict] | None = None) -> int:
     return sum(
         1
         for acc in accounts
-        if not _is_main_account_email(acc.get("email")) and acc.get("status") in seat_statuses
+        if not _is_main_account_email(acc.get("email"))
+        and not is_account_disabled(acc)
+        and acc.get("status") in seat_statuses
     )
 
 
@@ -2216,6 +2288,112 @@ def remove_from_team(chatgpt_api, email, *, return_status=False, lookup_retries=
         return "failed" if return_status else False
 
 
+def _wait_for_remote_capacity_after_removal(
+    chatgpt_api,
+    *,
+    target: int,
+    removed_email: str,
+    timeout: int = 24,
+    poll_interval: float = 3.0,
+    stage_label: str = "[Team]",
+) -> tuple[int, bool]:
+    """Poll Team member count after a removal before creating a replacement."""
+    deadline = time.time() + max(1, int(timeout))
+    latest_count = -1
+    while time.time() < deadline:
+        latest_count = get_team_member_count(chatgpt_api)
+        if latest_count >= 0 and latest_count < target:
+            logger.info("%s 已释放 %s 的席位，当前成员 %d/%d", stage_label, removed_email, latest_count, target)
+            return latest_count, True
+        logger.info(
+            "%s 等待 %s 的远端席位释放，当前成员=%s/%d",
+            stage_label,
+            removed_email,
+            latest_count if latest_count >= 0 else "unknown",
+            target,
+        )
+        time.sleep(max(0.5, float(poll_interval)))
+    return latest_count, False
+
+
+def _get_remote_team_member(email: str | None, chatgpt_api=None) -> dict | None:
+    """Return remote Team member by email, or None when absent/unknown."""
+    email_l = _normalized_email(email)
+    if not email_l:
+        return None
+    owns_api = chatgpt_api is None
+    api = chatgpt_api or ChatGPTTeamAPI()
+    try:
+        if owns_api or not _chatgpt_session_ready(api):
+            api.start()
+        members, _invites = fetch_team_state(api)
+        for member in members:
+            if _normalized_email(member.get("email")) == email_l:
+                return member
+        return None
+    finally:
+        if owns_api:
+            try:
+                api.stop()
+            except Exception:
+                pass
+
+
+def _validate_managed_account_operational(
+    email: str,
+    *,
+    threshold: int,
+    stage_label: str = "[轮转验收]",
+    chatgpt_api=None,
+) -> bool:
+    """Validate a newly managed child is remotely present and has usable Codex auth/quota."""
+    acc = find_account(load_accounts(), email)
+    if not acc:
+        logger.warning("%s %s 本地账号不存在", stage_label, email)
+        return False
+    if is_account_disabled(acc):
+        logger.warning("%s %s 已禁用，不能计入可用 child", stage_label, email)
+        return False
+    if acc.get("status") != STATUS_ACTIVE:
+        logger.warning("%s %s status=%s，不能计入可用 child", stage_label, email, acc.get("status"))
+        return False
+    if not _has_auth_file(acc):
+        logger.warning("%s %s 缺少可用 auth_file", stage_label, email)
+        return False
+
+    if chatgpt_api is not None:
+        try:
+            member = _get_remote_team_member(email, chatgpt_api=chatgpt_api)
+        except Exception as exc:
+            logger.warning("%s 查询远端成员失败: %s (%s)", stage_label, email, exc)
+            member = None
+        if not member:
+            logger.warning("%s %s 未出现在远端 Team 成员列表", stage_label, email)
+            return False
+
+    try:
+        auth_data = json.loads(read_text(Path(acc["auth_file"])))
+        access_token = auth_data.get("access_token")
+        if not access_token:
+            logger.warning("%s %s auth_file 缺少 access_token", stage_label, email)
+            return False
+        status_str, info = check_codex_quota(access_token)
+    except Exception as exc:
+        logger.warning("%s %s quota 验证异常: %s", stage_label, email, exc)
+        return False
+
+    if status_str != "ok" or not isinstance(info, dict):
+        logger.warning("%s %s quota 验证失败: %s", stage_label, email, status_str)
+        return False
+    primary_remaining = 100 - int(info.get("primary_pct", 100) or 100)
+    if primary_remaining < int(threshold):
+        logger.warning("%s %s quota 剩余 %d%% < %d%%", stage_label, email, primary_remaining, threshold)
+        return False
+    update_account(email, last_quota=info, last_active_at=time.time())
+    logger.info("%s %s 运行态验收通过，5h 剩余 %d%%", stage_label, email, primary_remaining)
+    return True
+
+
 def _kick_team_seat_after_oauth_failure(email: str, *, reason: str) -> None:
     """OAuth 失败时同步 KICK ws,消除"workspace 有 + 本地 auth 缺失"残废延迟。
 
@@ -3694,59 +3872,97 @@ def _extract_session_token_from_context(context):
     return session_token or None
 
 
-def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None):
-    """
-    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
-    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
-    leave_workspace: 加入 workspace 后是否立即退出，转为 personal 模式跑 OAuth。
-    out_outcome:     可选 dict，函数会把最终结局（success/phone_blocked/duplicate_exhausted/register_failed/...）
-                     + 统计信息（register_attempts / duplicate_swaps / last_email / reason）写入，供上游汇总。
+def _direct_register_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
-    捕获 RegisterBlocked：
-    - is_phone=True:     当前邮箱已暴露给 OpenAI，立即删邮箱、整个账号放弃（return None）
-    - is_duplicate=True: 换个临时邮箱继续尝试，独立计数不消耗 register_attempts
-    - 其他异常:          归入现有 retry 计数
 
-    Round 12 S4: `mail_client` 改为可选(默认 None) — None 时按 `acc`(可选)走
-    `_get_mail_client_for_account(acc)` 路由;旧调用方显式传 mail_client 时完全
-    保留旧行为(向后兼容)。register-level 多 provider rotation 由 `MAIL_PROVIDER_CHAIN`
-    env 驱动:配置 chain 时 `get_mail_client()` 返回 `FallbackMailProvider`,
-    自动在 mail-API 级失败时降级;邮箱-粒度的 provider 切换通过 `RegisterPathRotator`
-    包装(参见 `autoteam.mail.register_dual_path`),业务调用方可自行编排。
+def _direct_register_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
-    Round 12 wire-up (M3): `path_rotator` 可选 — 传入 `RegisterPathRotator` 实例时
-    启用邮箱-粒度的 provider 切换(OTP_TIMEOUT / DOMAIN_REJECTED / INVITE_LINK_MISSING
-    自动切下一 provider 重试整个注册流程);None 时走旧逻辑(单 provider + retry 3 次).
-    """
+
+def _cap_direct_register_parallel(requested: int) -> int:
+    requested = max(1, min(4, int(requested or 1)))
+    if requested <= 1:
+        return 1
+
+    try:
+        from autoteam.runtime_resources import collect_runtime_resource_snapshot
+
+        snapshot = collect_runtime_resource_snapshot()
+    except Exception as exc:
+        logger.debug("[直接注册] 读取资源快照失败，保留并行=%d: %s", requested, exc)
+        return requested
+
+    memory_ratio = snapshot.get("cgroup_memory_usage_ratio")
+    browser_live = int(snapshot.get("browser_process_live") or 0)
+    warn_ratio = _direct_register_float_env("AUTOTEAM_REGISTER_PARALLEL_MEMORY_WARN_RATIO", 0.72)
+    max_browser_live = _direct_register_int_env("AUTOTEAM_REGISTER_PARALLEL_MAX_BROWSER_LIVE", 4)
+
+    if memory_ratio is not None and float(memory_ratio) >= warn_ratio:
+        logger.warning(
+            "[直接注册] 内存占用 %.1f%% >= %.1f%%，并行注册从 %d 降级为 1，避免 OOM",
+            float(memory_ratio) * 100,
+            warn_ratio * 100,
+            requested,
+        )
+        return 1
+
+    if browser_live >= max_browser_live:
+        logger.warning(
+            "[直接注册] 浏览器进程数 %d >= %d，并行注册从 %d 降级为 1，避免进程堆积",
+            browser_live,
+            max_browser_live,
+            requested,
+        )
+        return 1
+
+    return requested
+
+
+def _direct_register_parallel_size() -> int:
+    """读取并行尝试数（DIRECT_REGISTER_PARALLEL），范围 [1, 4]，再按本机资源降级。"""
+    try:
+        from autoteam.config import DIRECT_REGISTER_PARALLEL
+
+        raw = int(DIRECT_REGISTER_PARALLEL)
+    except Exception:
+        try:
+            raw = int(os.environ.get("DIRECT_REGISTER_PARALLEL", "1"))
+        except Exception:
+            raw = 1
+    return _cap_direct_register_parallel(raw)
+
+
+def _attempt_chatgpt_signup_only(mail_client, *, acc=None, out_outcome=None) -> dict:
+    """Run direct ChatGPT signup only; caller decides whether to persist/OAuth the winner."""
     from autoteam.invite import RegisterBlocked
 
-    # Round 12 wire-up M3 — 邮箱-粒度 provider 切换。
-    if path_rotator is not None:
-        return _create_account_direct_via_rotator(
-            path_rotator,
-            leave_workspace=leave_workspace,
-            out_outcome=out_outcome,
-            acc=acc,
-        )
-
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
-
     account_id, email = mail_client.create_temp_email()
     password = random_password()
     signup_profile = generate_signup_profile()
     auth_proxy_url = ""
     playwright_proxy_url = ""
+    local_outcome: dict = {}
 
     def _record_outcome(status, **extra):
+        local_outcome.clear()
+        local_outcome.update(
+            status=status,
+            last_email=email,
+            register_attempts=register_attempts,
+            duplicate_swaps=duplicate_swaps,
+            **extra,
+        )
         if out_outcome is not None:
             out_outcome.clear()
-            out_outcome.update(
-                status=status,
-                last_email=email,
-                register_attempts=register_attempts,
-                duplicate_swaps=duplicate_swaps,
-                **extra,
-            )
+            out_outcome.update(local_outcome)
 
     def _discard_email(reason):
         try:
@@ -3773,6 +3989,20 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
             _record_outcome("ipv6_proxy_unavailable", reason=str(exc))
             return False
 
+    def _build_result(success_value: bool) -> dict:
+        return {
+            "success": bool(success_value),
+            "email": email,
+            "password": password,
+            "account_id": account_id,
+            "session_token": session_token,
+            "signup_profile": signup_profile,
+            "auth_proxy_url": auth_proxy_url,
+            "playwright_proxy_url": playwright_proxy_url,
+            "mail_client": mail_client,
+            "outcome": dict(local_outcome),
+        }
+
     # 注册失败（非 duplicate）最多重试 3 次；duplicate 额外独立上限，防止 CloudMail 异常导致无限换邮箱
     success = False
     session_token = None  # Round 11 四轮 — 注册成功后从 chatgpt.com 抽出来,透给 personal OAuth 跳过 /log-in
@@ -3781,7 +4011,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     register_attempts = 0
     duplicate_swaps = 0
     if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable"):
-        return None
+        return _build_result(False)
 
     while register_attempts < MAX_REGISTER_ATTEMPTS:
         logger.info(
@@ -3826,7 +4056,7 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
                     duplicate_swaps=duplicate_swaps,
                 )
                 _record_outcome("phone_blocked", reason=f"add-phone 手机验证 step={blocked.step}", step=blocked.step)
-                return None
+                return _build_result(False)
             if blocked.is_duplicate:
                 # 邮箱重复 → 换一个全新的临时邮箱再来，不计入 register_attempts
                 duplicate_swaps += 1
@@ -3843,14 +4073,14 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
                         "duplicate_exhausted",
                         reason=f"duplicate 换邮箱 {duplicate_swaps} 次仍失败",
                     )
-                    return None
+                    return _build_result(False)
                 _discard_email("duplicate")
                 account_id, email = mail_client.create_temp_email()
                 password = random_password()
                 signup_profile = generate_signup_profile()
                 logger.info("[直接注册] 已换新临时邮箱: %s", email)
                 if not _assign_proxy_or_fail("ipv6_proxy_required_unavailable_after_duplicate"):
-                    return None
+                    return _build_result(False)
                 continue
             # 其他阻断按普通失败处理
             success = False
@@ -3904,14 +4134,182 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
             duplicate_swaps=duplicate_swaps,
         )
         _record_outcome("register_failed", reason=f"注册 {register_attempts} 次均未进入 Team")
+        return _build_result(False)
+
+    _record_outcome("success", reason="")
+    return _build_result(True)
+
+
+def _direct_signup_mail_client_factory(base_mail_client, acc=None):
+    def _factory(idx: int):
+        if idx <= 0:
+            return base_mail_client
+        try:
+            client = type(base_mail_client)()
+        except Exception:
+            client = _resolve_mail_client_or_default(None, acc=acc)
+        login = getattr(client, "login", None)
+        if callable(login):
+            login()
+        return client
+
+    return _factory
+
+
+def _discard_direct_signup_loser(outcome: dict) -> None:
+    email = outcome.get("email")
+    account_id = outcome.get("account_id")
+    mail_client = outcome.get("mail_client")
+    if email:
+        chatgpt = None
+        try:
+            chatgpt = ChatGPTTeamAPI()
+            chatgpt.start()
+            remove_from_team(chatgpt, email, return_status=True)
+        except Exception as exc:
+            logger.warning("[直接注册] 清理并行 loser Team 席位失败: %s (%s)", email, exc)
+        finally:
+            if chatgpt is not None:
+                try:
+                    chatgpt.stop()
+                except Exception:
+                    pass
+        _release_account_ipv6_proxy(email)
+    if account_id is not None and mail_client is not None:
+        try:
+            mail_client.delete_account(account_id)
+            logger.info("[直接注册] 已丢弃并行 loser 临时邮箱: %s", email)
+        except Exception as exc:
+            logger.warning("[直接注册] 丢弃并行 loser 临时邮箱失败: %s (%s)", email, exc)
+
+
+def _race_chatgpt_signup(mail_client_factory, *, parallel: int, acc=None, out_outcome=None) -> dict:
+    """Run direct signup race and return the first successful signup-only outcome."""
+    import concurrent.futures
+
+    parallel = _cap_direct_register_parallel(parallel)
+    if parallel <= 1:
+        return _attempt_chatgpt_signup_only(mail_client_factory(0), acc=acc, out_outcome=out_outcome)
+
+    logger.info("[直接注册] 启动 %d 个并行注册尝试", parallel)
+    winner: dict | None = None
+    failures: list[dict] = []
+    losers: list[dict] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="direct-signup") as pool:
+        future_map = {
+            pool.submit(
+                _attempt_chatgpt_signup_only,
+                mail_client_factory(idx),
+                acc=acc,
+            ): idx
+            for idx in range(parallel)
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                outcome = future.result()
+            except Exception as exc:
+                logger.warning("[直接注册] 并行 worker 异常: %s", exc)
+                failures.append({"success": False, "outcome": {"status": "exception", "reason": str(exc)}})
+                continue
+            if outcome.get("success") and winner is None:
+                winner = outcome
+                logger.info("[直接注册] 并行获胜: %s", outcome.get("email"))
+            elif outcome.get("success"):
+                losers.append(outcome)
+            else:
+                failures.append(outcome)
+
+    for loser in losers:
+        _discard_direct_signup_loser(loser)
+
+    selected = winner or (failures[-1] if failures else {"success": False, "outcome": {"status": "register_failed"}})
+    if out_outcome is not None:
+        out_outcome.clear()
+        out_outcome.update(selected.get("outcome") or {})
+        out_outcome["direct_register_parallel"] = parallel
+        out_outcome["direct_register_failures"] = len(failures)
+        out_outcome["direct_register_losers"] = len(losers)
+    return selected
+
+
+def create_account_direct(
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    path_rotator=None,
+    parallel: int | None = None,
+):
+    """
+    直接注册模式（域名已配置自动加入 workspace，不需要邀请）。
+    流程：创建邮箱 → 注册 ChatGPT → 自动加入 workspace → Codex 登录
+    leave_workspace: 加入 workspace 后是否立即退出，转为 personal 模式跑 OAuth。
+    out_outcome:     可选 dict，函数会把最终结局（success/phone_blocked/duplicate_exhausted/register_failed/...）
+                     + 统计信息（register_attempts / duplicate_swaps / last_email / reason）写入，供上游汇总。
+    parallel:        direct signup race 并行度；None 时读取 DIRECT_REGISTER_PARALLEL 并按资源预算降级。
+
+    捕获 RegisterBlocked：
+    - is_phone=True:     当前邮箱已暴露给 OpenAI，立即删邮箱、整个账号放弃（return None）
+    - is_duplicate=True: 换个临时邮箱继续尝试，独立计数不消耗 register_attempts
+    - 其他异常:          归入现有 retry 计数
+
+    Round 12 S4: `mail_client` 改为可选(默认 None) — None 时按 `acc`(可选)走
+    `_get_mail_client_for_account(acc)` 路由;旧调用方显式传 mail_client 时完全
+    保留旧行为(向后兼容)。register-level 多 provider rotation 由 `MAIL_PROVIDER_CHAIN`
+    env 驱动:配置 chain 时 `get_mail_client()` 返回 `FallbackMailProvider`,
+    自动在 mail-API 级失败时降级;邮箱-粒度的 provider 切换通过 `RegisterPathRotator`
+    包装(参见 `autoteam.mail.register_dual_path`),业务调用方可自行编排。
+
+    Round 12 wire-up (M3): `path_rotator` 可选 — 传入 `RegisterPathRotator` 实例时
+    启用邮箱-粒度的 provider 切换(OTP_TIMEOUT / DOMAIN_REJECTED / INVITE_LINK_MISSING
+    自动切下一 provider 重试整个注册流程);None 时走旧逻辑(单 provider + retry 3 次).
+    """
+    # Round 12 wire-up M3 — 邮箱-粒度 provider 切换。
+    if path_rotator is not None:
+        return _create_account_direct_via_rotator(
+            path_rotator,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            parallel=parallel,
+        )
+
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+    if parallel is None:
+        parallel = _direct_register_parallel_size()
+    else:
+        parallel = _cap_direct_register_parallel(parallel)
+
+    if parallel <= 1:
+        signup = _attempt_chatgpt_signup_only(mail_client, acc=acc, out_outcome=out_outcome)
+    else:
+        signup = _race_chatgpt_signup(
+            _direct_signup_mail_client_factory(mail_client, acc=acc),
+            parallel=parallel,
+            acc=acc,
+            out_outcome=out_outcome,
+        )
+
+    if not signup.get("success"):
         return None
+
+    email = signup["email"]
+    password = signup["password"]
+    account_id = signup["account_id"]
+    session_token = signup.get("session_token")
+    signup_profile = signup.get("signup_profile")
+    auth_proxy_url = signup.get("auth_proxy_url") or ""
+    playwright_proxy_url = signup.get("playwright_proxy_url") or ""
+    winner_mail_client = signup.get("mail_client") or mail_client
 
     add_account(email, password, cloudmail_account_id=account_id, workspace_account_id=get_chatgpt_account_id() or None)
 
     post_result = _run_post_register_oauth(
         email,
         password,
-        mail_client,
+        winner_mail_client,
         leave_workspace=leave_workspace,
         out_outcome=out_outcome,
         chatgpt_session_token=session_token,
@@ -3924,7 +4322,9 @@ def create_account_direct(mail_client=None, *, leave_workspace=False, out_outcom
     return post_result
 
 
-def _create_account_direct_via_rotator(path_rotator, *, leave_workspace=False, out_outcome=None, acc=None):
+def _create_account_direct_via_rotator(
+    path_rotator, *, leave_workspace=False, out_outcome=None, acc=None, parallel: int | None = None
+):
     """Round 12 wire-up (M3) — 用 RegisterPathRotator 编排邮箱-粒度的 provider 切换。
 
     流程:
@@ -3955,6 +4355,7 @@ def _create_account_direct_via_rotator(path_rotator, *, leave_workspace=False, o
             out_outcome=local_outcome,
             acc=acc,
             path_rotator=None,  # 避免递归
+            parallel=parallel,
         )
         if result_email is None:
             status = local_outcome.get("status") or "register_failed"
@@ -4003,7 +4404,16 @@ def _create_account_direct_via_rotator(path_rotator, *, leave_workspace=False, o
         return None
 
 
-def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None):
+def create_new_account(
+    chatgpt_api,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+    path_rotator=None,
+    parallel: int | None = None,
+):
     """
     创建新账号。优先用直接注册模式（域名自动加入 workspace）。
     chatgpt_api 可为 None（直接注册不需要）。
@@ -4014,8 +4424,12 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
     """
     # 先检查 pending invites
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+    try:
+        from autoteam.config import ROTATE_SKIP_REUSE
+    except Exception:
+        ROTATE_SKIP_REUSE = False
 
-    if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
+    if chatgpt_api and _chatgpt_session_ready(chatgpt_api) and not ROTATE_SKIP_REUSE:
         logger.info("[创建] 先检查 pending invites...")
         completed = _check_pending_invites(
             chatgpt_api,
@@ -4026,6 +4440,8 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
         if completed:
             logger.info("[创建] 从 pending invites 完成了 %d 个账号", len(completed))
             return completed[0]
+    elif chatgpt_api and _chatgpt_session_ready(chatgpt_api):
+        logger.info("[创建] ROTATE_SKIP_REUSE 启用：跳过历史 pending invite，只创建新账号")
 
     # 直接注册模式（不需要邀请）
     logger.info("[创建] 使用直接注册模式...")
@@ -4037,6 +4453,7 @@ def create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, 
         out_outcome=out_outcome,
         acc=acc,
         path_rotator=path_rotator,
+        parallel=parallel,
     )
 
 
@@ -4689,8 +5106,10 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
     """
     TARGET = _clamp_team_target_seats(target_seats)
     ACTIVE_TARGET = _pool_active_target(TARGET)
+    started_at = time.time()
 
-    from autoteam.config import AUTO_CHECK_THRESHOLD
+    from autoteam.config import AUTO_CHECK_THRESHOLD, ROTATE_MAX_DURATION, ROTATE_SKIP_REUSE
+    rotate_deadline = started_at + float(ROTATE_MAX_DURATION)
 
     try:
         from autoteam.api import _auto_check_config
@@ -4698,6 +5117,28 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         threshold = _auto_check_config.get("threshold", AUTO_CHECK_THRESHOLD)
     except ImportError:
         threshold = AUTO_CHECK_THRESHOLD
+
+    def _bump(stage: str) -> None:
+        try:
+            from autoteam.api import bump_task_progress
+
+            bump_task_progress(stage)
+        except Exception:
+            pass
+
+    def _deadline_exceeded(stage: str) -> bool:
+        if time.time() < rotate_deadline:
+            return False
+        logger.warning(
+            "[轮转] 总时长熔断触发 (%s)，已用 %ds，优雅退出本轮 rotate",
+            stage,
+            int(time.time() - started_at),
+        )
+        return True
+
+    skip_reuse = bool(ROTATE_SKIP_REUSE)
+    if skip_reuse:
+        logger.info("[轮转] ROTATE_SKIP_REUSE 启用：跳过旧号复用，优先释放不可用占席子号后创建新号")
 
     chatgpt = None
     mail_client = None
@@ -4766,9 +5207,11 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
             return ensure_mail()
 
     logger.info("[1/5] 同步 Team 状态...")
+    _bump("rotate:sync_team")
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
+    _bump("rotate:check_quota")
     cmd_check()
 
     # Round 12 S5 — 预测式抢先替换(可选,默认关).
@@ -4814,29 +5257,41 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         # 移出所有 exhausted 账号（包括之前已标记的）
         all_accounts = load_accounts()
         all_exhausted = [
-            a for a in all_accounts if a["status"] == STATUS_EXHAUSTED and not _is_main_account_email(a.get("email"))
+            a
+            for a in all_accounts
+            if _is_replaceable_pool_blocker(a)
         ]
         initial_api_count = -1
         removed_now = 0
         already_absent_count = 0
 
         if all_exhausted:
-            logger.info("[3/5] 移出 %d 个额度用完的账号...", len(all_exhausted))
+            logger.info("[3/5] 移出 %d 个不可用占席账号...", len(all_exhausted))
             ensure_chatgpt()
             initial_api_count = get_team_member_count(chatgpt)
             for acc in all_exhausted:
+                if _deadline_exceeded("rotate:remove_blockers"):
+                    break
                 email = acc["email"]
+                reason = _replaceable_pool_blocker_reason(acc) or "replaceable_pool_blocker"
                 if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
                 remove_status = remove_from_team(chatgpt, email, return_status=True)
                 if remove_status in ("removed", "already_absent"):
-                    update_account(email, status=STATUS_STANDBY)
+                    update_account(email, status=STATUS_STANDBY, _reason=reason)
                     if remove_status == "removed":
                         removed_now += 1
-                        logger.info("[3/5] %s → standby（已从 Team 移出）", email)
+                        logger.info("[3/5] %s → standby（已从 Team 移出）| reason=%s", email, reason)
+                        _wait_for_remote_capacity_after_removal(
+                            chatgpt,
+                            target=TARGET,
+                            removed_email=email,
+                            timeout=24,
+                            stage_label="[3/5]",
+                        )
                     else:
                         already_absent_count += 1
-                        logger.info("[3/5] %s → standby（远端已不存在）", email)
+                        logger.info("[3/5] %s → standby（远端已不存在）| reason=%s", email, reason)
         else:
             logger.info("[3/5] 无需移出账号")
         if not chatgpt or not _chatgpt_session_ready(chatgpt):
@@ -4880,7 +5335,12 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                 # 只移除本地管理的账号，优先移除额度最低的
                 all_accs = load_accounts()
                 local_active = [
-                    a for a in all_accs if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"))
+                    a
+                    for a in all_accs
+                    if a["status"] == STATUS_ACTIVE
+                    and not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                    and not _is_protected_local_credential_seat(a)
                 ]
                 # 按额度排序，额度低的优先移除
                 local_active.sort(key=lambda a: 100 - (a.get("last_quota") or {}).get("primary_pct", 0))
@@ -4916,7 +5376,11 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
         # 注: 不截断到 vacancies — 旧行为会迭代全部 standby,遇到不可复用的(skipped_auto/
         # skipped_quota)就继续看下一个,直到 filled >= vacancies 才 break. 截断会导致
         # 第一个候选若 skipped 则放弃后续可用候选,破坏 test_cmd_rotate_skips_google_accounts.
-        candidates = list(standby_list)
+        if skip_reuse:
+            logger.info("[4/5] ROTATE_SKIP_REUSE 启用：跳过 standby 复用，直接创建新账号补位")
+            candidates = []
+        else:
+            candidates = list(standby_list)
 
         def _chatgpt_provider():
             if not chatgpt or not _chatgpt_session_ready(chatgpt):
@@ -4957,6 +5421,8 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
             for acc in candidates:
                 if cancel_signal.is_cancelled():
                     logger.warning("[轮转] 收到取消请求,中止 standby 复用阶段")
+                    break
+                if _deadline_exceeded("rotate:standby_reuse"):
                     break
                 if filled >= vacancies:
                     break
@@ -5038,11 +5504,29 @@ def cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=Fal
                 if cancel_signal.is_cancelled():
                     logger.warning("[轮转] 收到取消请求,已创建 %d/%d 个新号", i, remaining)
                     break
+                if _deadline_exceeded("rotate:create_new"):
+                    break
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
                 if not chatgpt or not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
-                if create_new_account(chatgpt, ensure_mail()):
+                created_email = create_new_account(chatgpt, ensure_mail())
+                if created_email and (
+                    not isinstance(created_email, str)
+                    or _validate_managed_account_operational(
+                        created_email,
+                        threshold=threshold,
+                        stage_label="[轮转验收]",
+                        chatgpt_api=chatgpt,
+                    )
+                ):
                     current_count += 1
+                elif created_email:
+                    logger.warning("[5/5] 新账号未通过运行验收，释放席位并丢弃: %s", created_email)
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    remove_status = remove_from_team(chatgpt, created_email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(created_email, status=STATUS_STANDBY, _reason="new_account_not_ready")
 
         if not chatgpt or not _chatgpt_session_ready(chatgpt):
             ensure_chatgpt()
@@ -5346,7 +5830,7 @@ def get_team_member_count(chatgpt_api):
     return len(members)
 
 
-def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=True):
+def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=True, direct_parallel: int | None = None):
     """
     补位流程。
     leave_workspace=False: 补满 Team 席位到 target（原行为），优先复用 standby 旧号
@@ -5357,6 +5841,7 @@ def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=Tr
     if leave_workspace:
         return _cmd_fill_personal(target)
     target = _clamp_team_target_seats(target)
+    from autoteam.config import AUTO_CHECK_THRESHOLD, ROTATE_SKIP_REUSE
 
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
@@ -5377,11 +5862,17 @@ def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=Tr
             return
 
         logger.info("[填充] 需要添加 %d 个账号", need)
-        standby_list = [
-            a
-            for a in get_standby_accounts()
-            if a.get("_quota_recovered") and not _is_main_account_email(a.get("email"))
-        ]
+        if ROTATE_SKIP_REUSE:
+            logger.info("[填充] ROTATE_SKIP_REUSE 启用：不复用旧账号，只创建新账号补位")
+            standby_list = []
+        else:
+            standby_list = [
+                a
+                for a in get_standby_accounts()
+                if a.get("_quota_recovered")
+                and not _is_main_account_email(a.get("email"))
+                and not is_account_disabled(a)
+            ]
         standby_index = 0
 
         from autoteam import cancel_signal
@@ -5416,7 +5907,27 @@ def cmd_fill(target=3, leave_workspace=False, *, post_sync=True, print_status=Tr
                 logger.info("[填充] 创建新账号...")
                 if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
-                added = create_new_account(chatgpt, mail_client)
+                if direct_parallel is None:
+                    created_email = create_new_account(chatgpt, mail_client)
+                else:
+                    created_email = create_new_account(chatgpt, mail_client, parallel=direct_parallel)
+                if created_email and (
+                    not isinstance(created_email, str)
+                    or _validate_managed_account_operational(
+                        created_email,
+                        threshold=AUTO_CHECK_THRESHOLD,
+                        stage_label="[填充验收]",
+                        chatgpt_api=chatgpt,
+                    )
+                ):
+                    added = created_email
+                elif created_email:
+                    logger.warning("[填充] 新账号未通过运行验收，释放席位并丢弃: %s", created_email)
+                    if not _chatgpt_session_ready(chatgpt):
+                        chatgpt.start()
+                    remove_status = remove_from_team(chatgpt, created_email, return_status=True)
+                    if remove_status in ("removed", "already_absent"):
+                        update_account(created_email, status=STATUS_STANDBY, _reason="fill_new_account_not_ready")
 
             if not added:
                 logger.warning("[填充] 本轮补位失败，第 %d/%d 个空缺仍未填上", i + 1, need)

@@ -3592,6 +3592,22 @@ def _auto_check_loop():
                 and a.get("auth_file")
                 and Path(a["auth_file"]).exists()
             ]
+            try:
+                from autoteam.manager import _replaceable_pool_blocker_reason
+
+                replaceable_blockers = [
+                    {
+                        "email": a.get("email"),
+                        "reason": reason,
+                    }
+                    for a in accounts
+                    if not _is_main_account_email(a.get("email"))
+                    and not is_account_disabled(a)
+                    and (reason := _replaceable_pool_blocker_reason(a))
+                ]
+            except Exception as exc:
+                logger.warning("[巡检] 本地占席 blocker 分类失败: %s", exc)
+                replaceable_blockers = []
 
             # Watchdog:active 账号数 < 子号目标时自动补位。
             # 之前的 `if not active: continue` 在 active 全 kick 进 standby
@@ -3615,10 +3631,20 @@ def _auto_check_loop():
                     # 否则 cooldown 会把实际席位缺口拖到下一轮甚至 4h backoff 之后。
                     actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
                     if actual_team_count >= target_seats:
-                        logger.info(
-                            "[巡检] auto-fill 冷却中且 Team 实际成员数=%d 已满；本轮只保留低额度替换检查",
-                            actual_team_count,
-                        )
+                        if replaceable_blockers:
+                            logger.warning(
+                                "[巡检] auto-fill 冷却中但 Team 已满且存在 %d 个不可用占席子号，继续触发轮转: %s",
+                                len(replaceable_blockers),
+                                ", ".join(
+                                    f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
+                                ),
+                            )
+                            should_start_auto_fill = True
+                        else:
+                            logger.info(
+                                "[巡检] auto-fill 冷却中且 Team 实际成员数=%d 已满；本轮只保留低额度替换检查",
+                                actual_team_count,
+                            )
                     elif actual_team_count >= 0:
                         logger.info(
                             "[巡检] auto-fill 冷却中但 Team 实际成员不足（%d/%d），继续补位",
@@ -3667,13 +3693,23 @@ def _auto_check_loop():
 
                     actual_team_count = _auto_check_team_member_count(timeout_seconds=30, retries=2)
                     if actual_team_count >= target_seats:
-                        logger.info(
-                            "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
-                            len(active),
-                            sub_account_target,
-                            actual_team_count,
-                        )
-                        continue
+                        if replaceable_blockers:
+                            logger.warning(
+                                "[巡检] Team 已满但本地 active=%d/%d 且存在不可用占席子号，触发 auto-fill 修复: %s",
+                                len(active),
+                                sub_account_target,
+                                ", ".join(
+                                    f"{item['email']}({item['reason']})" for item in replaceable_blockers[:5]
+                                ),
+                            )
+                        else:
+                            logger.info(
+                                "[巡检] 本地 active=%d < %d,但 Team 实际成员数=%d 已满；先跳过 auto-fill,等待同步/对账稳定",
+                                len(active),
+                                sub_account_target,
+                                actual_team_count,
+                            )
+                            continue
                     should_start_auto_fill = True
 
                 if should_start_auto_fill:

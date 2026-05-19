@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "backend task entrypoint and applicable spec index"}
+{"file": ".trellis/spec/backend/free-registration-hardening.md", "reason": "direct signup race, fill-personal, Team seat, SignupProfile, and managed child validation contracts"}
+{"file": ".trellis/spec/backend/runtime-docker-hardening.md", "reason": "multi-master direct parallel budget, runtime downgrade, Playwright/browser budget, and status contracts"}
+{"file": ".trellis/spec/backend/account-disable-cpa-sync.md", "reason": "disabled accounts and CPA delete guard must remain excluded from automated rotation/reuse/sync"}
+{"file": ".trellis/spec/guides/index.md", "reason": "shared code-reuse and cross-layer thinking triggers for config/API/manager changes"}
+{"file": ".trellis/tasks/05-19-autoteam1-seat-rotation-hardening-migration/research/current-vs-autoteam1-seat-rotation.md", "reason": "current vs autoteam-1 migration comparison and selected Approach B context"}

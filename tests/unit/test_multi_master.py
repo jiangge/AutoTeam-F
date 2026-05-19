@@ -129,7 +129,7 @@ def test_run_multi_master_fill_isolates_owner_failures(tmp_path, monkeypatch):
     seen = []
     lock = threading.Lock()
 
-    def fake_cmd_fill(target, leave_workspace=False, post_sync=True, print_status=True):
+    def fake_cmd_fill(target, leave_workspace=False, post_sync=True, print_status=True, direct_parallel=None):
         with lock:
             seen.append(
                 (
@@ -139,6 +139,7 @@ def test_run_multi_master_fill_isolates_owner_failures(tmp_path, monkeypatch):
                     leave_workspace,
                     post_sync,
                     print_status,
+                    direct_parallel,
                 )
             )
         if admin_state.get_admin_email() == "owner-b@example.com":
@@ -157,8 +158,8 @@ def test_run_multi_master_fill_isolates_owner_failures(tmp_path, monkeypatch):
 
     assert result["status"] == "partial_failed"
     assert {row[0] for row in seen} == {"owner-a@example.com", "owner-b@example.com"}
-    assert ("owner-a@example.com", UUID_A, 3, False, False, False) in seen
-    assert ("owner-b@example.com", UUID_B, 3, False, False, False) in seen
+    assert ("owner-a@example.com", UUID_A, 3, False, False, False, 1) in seen
+    assert ("owner-b@example.com", UUID_B, 3, False, False, False, 1) in seen
     assert result["post_sync"] == {"skipped": True}
     owner_b = next(owner for owner in result["owners"] if owner["admin_email"] == "owner-b@example.com")
     assert owner_b["status"] == "failed"

@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "backend quality verification entrypoint"}
+{"file": ".trellis/spec/backend/free-registration-hardening.md", "reason": "verify direct signup race, child validation, and Team seat contracts"}
+{"file": ".trellis/spec/backend/runtime-docker-hardening.md", "reason": "verify multi-master budget propagation and runtime downgrade behavior"}
+{"file": ".trellis/spec/backend/account-disable-cpa-sync.md", "reason": "verify disabled/protected credential and CPA guard behavior was not weakened"}
+{"file": ".trellis/tasks/05-19-autoteam1-seat-rotation-hardening-migration/research/current-vs-autoteam1-seat-rotation.md", "reason": "verify implementation matches the migration slice and avoids whole-file copying"}
