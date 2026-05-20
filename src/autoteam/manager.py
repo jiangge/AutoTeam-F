@@ -29,7 +29,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from autoteam.account_ops import delete_managed_account, fetch_team_state
+from autoteam.account_ops import delete_managed_account, delete_team_invite, fetch_team_state, team_invite_email
 from autoteam.accounts import (
     STATUS_ACTIVE,
     STATUS_AUTH_INVALID,
@@ -83,13 +83,15 @@ from autoteam.sync_targets import (
 from autoteam.sync_targets import (
     sync_to_configured_targets as sync_to_cpa,
 )
-from autoteam.textio import read_text, write_text
+from autoteam.textio import parse_env_value, read_text, write_text
 
 logger = logging.getLogger(__name__)
 
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 TEAM_SEATS_MIN = 2
 TEAM_SEATS_MAX = 3
+ROTATE_NEW_ACCOUNT_MODE_DEFAULT = "domain_auto_join_first"
+ROTATE_NEW_ACCOUNT_MODES = {"domain_auto_join_first", "invite_first", "direct_first"}
 
 # Round 11 二轮收尾 — OAuth 子进程默认超时(秒)。任何 subprocess 包裹 login_codex_via_browser
 # (probe 脚本 / 异步 worker / CLI 工具) 必须用此常量,不再硬编码 60s。
@@ -130,6 +132,73 @@ def _extract_raw_rate_limit_str(quota_info) -> str:
 
 def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
+
+
+def _normalized_domain(value: str | None) -> str:
+    return str(value or "").strip().lower().lstrip("@").rstrip(".")
+
+
+def _runtime_env_value(name: str, default: str = "") -> str:
+    return str(parse_env_value(os.environ.get(name, default)) or "").strip()
+
+
+def _runtime_bool_env(name: str, default: bool) -> bool:
+    raw = _runtime_env_value(name, "")
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on", "enabled", "y", "t"}
+
+
+def _runtime_new_account_mode() -> str:
+    mode = _runtime_env_value("ROTATE_NEW_ACCOUNT_MODE", ROTATE_NEW_ACCOUNT_MODE_DEFAULT).lower()
+    if mode in ROTATE_NEW_ACCOUNT_MODES:
+        return mode
+    logger.warning(
+        "[创建] ROTATE_NEW_ACCOUNT_MODE=%s 无效，回退到 %s",
+        mode or "<empty>",
+        ROTATE_NEW_ACCOUNT_MODE_DEFAULT,
+    )
+    return ROTATE_NEW_ACCOUNT_MODE_DEFAULT
+
+
+def _domain_auto_join_fallback_invite_enabled() -> bool:
+    return _runtime_bool_env("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", True)
+
+
+def _configured_mail_domains(mail_client=None) -> set[str]:
+    domains: set[str] = set()
+    for value in (
+        get_mail_domain(),
+        os.environ.get("CLOUDMAIL_DOMAIN", ""),
+        os.environ.get("MAILLAB_DOMAIN", ""),
+        os.environ.get("CF_TEMP_EMAIL_DOMAIN", ""),
+        os.environ.get("ADDY_IO_DOMAIN", ""),
+        getattr(mail_client, "domain", ""),
+        getattr(mail_client, "default_domain", ""),
+    ):
+        domain = _normalized_domain(value)
+        if domain:
+            domains.add(domain)
+    return domains
+
+
+def _auto_join_domain_allowlist(mail_client=None) -> tuple[set[str], bool]:
+    raw = _runtime_env_value("AUTOTEAM_AUTO_JOIN_DOMAINS", "auto")
+    if not raw or raw.lower() == "auto":
+        return _configured_mail_domains(mail_client), False
+    values = {_normalized_domain(item) for item in raw.split(",")}
+    values.discard("")
+    if "*" in values:
+        return set(), True
+    return values, False
+
+
+def _mail_domain_auto_join_allowed(mail_client=None) -> bool:
+    allowlist, wildcard = _auto_join_domain_allowlist(mail_client)
+    if wildcard:
+        return True
+    configured = _configured_mail_domains(mail_client)
+    return bool(configured and allowlist and configured.intersection(allowlist))
 
 
 def _is_main_account_email(email: str | None) -> bool:
@@ -2804,6 +2873,196 @@ def _get_remote_team_member(email: str | None, chatgpt_api=None) -> dict | None:
                 pass
 
 
+def _wait_for_email_in_team(
+    email: str | None,
+    *,
+    chatgpt_api=None,
+    timeout: int = 60,
+    stage_label: str = "[Team]",
+) -> dict | None:
+    target = _normalized_email(email)
+    if not target:
+        return None
+
+    deadline = time.time() + max(1, int(timeout))
+    last_member_count = -1
+    while time.time() < deadline:
+        member = _get_remote_team_member(target, chatgpt_api=chatgpt_api)
+        if member:
+            logger.info("%s 远端已确认 Team 成员: %s", stage_label, target)
+            return member
+
+        try:
+            if chatgpt_api is not None and _chatgpt_session_ready(chatgpt_api):
+                members, _invites = fetch_team_state(chatgpt_api)
+                last_member_count = len(members)
+        except Exception:
+            pass
+        logger.info("%s 等待远端成员出现: %s（当前成员数=%s）", stage_label, target, last_member_count)
+        time.sleep(3)
+
+    logger.warning("%s 超时仍未在远端 Team 成员列表看到: %s", stage_label, target)
+    return None
+
+
+def _remote_team_occupancy(chatgpt_api) -> tuple[int, int, int]:
+    members, invites = fetch_team_state(chatgpt_api)
+    return len(members), len(invites), len(members) + len(invites)
+
+
+def _has_remote_capacity_for_new_seat(chatgpt_api, *, stage_label: str = "[Team]") -> bool:
+    members_count, invites_count, occupancy = _remote_team_occupancy(chatgpt_api)
+    logger.info(
+        "%s 远端席位占用: members=%d invites=%d total=%d/%d",
+        stage_label,
+        members_count,
+        invites_count,
+        occupancy,
+        TEAM_SEATS_MAX,
+    )
+    if occupancy >= TEAM_SEATS_MAX:
+        logger.warning(
+            "%s 远端席位已满或有 pending invite 占位，停止添加新账号，避免超过 %d 人",
+            stage_label,
+            TEAM_SEATS_MAX,
+        )
+        return False
+    return True
+
+
+def _prepare_remote_capacity_for_new_seat(chatgpt_api, *, stage_label: str = "[创建]") -> bool:
+    if chatgpt_api is None:
+        return True
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+    if _has_remote_capacity_for_new_seat(chatgpt_api, stage_label=stage_label):
+        return True
+    _cancel_stale_pending_invites_for_capacity(chatgpt_api, stage_label=stage_label)
+    return _has_remote_capacity_for_new_seat(chatgpt_api, stage_label=stage_label)
+
+
+def _pending_invite_id(invite: dict | None):
+    if not isinstance(invite, dict):
+        return None
+    for key in ("id", "invite_id", "account_invite_id"):
+        value = invite.get(key)
+        if value:
+            return value
+    return None
+
+
+def _email_matches_current_mail_domain(email: str | None) -> bool:
+    email = _normalized_email(email)
+    domains = _configured_mail_domains()
+    return bool(email and domains and email.rsplit("@", 1)[-1] in domains)
+
+
+def _can_cancel_pending_invite(email: str, acc: dict | None) -> tuple[bool, str]:
+    if not email:
+        return False, "missing_email"
+    if _is_main_account_email(email):
+        return False, "main_account"
+    if acc and _has_auth_file(acc):
+        return False, "local_auth_protected"
+    if _find_team_auth_file(email) is not None:
+        return False, "auth_file_protected"
+    if acc:
+        return True, "local_managed_pending"
+    if _email_matches_current_mail_domain(email):
+        return True, "managed_domain_pending"
+    return False, "external_or_manual_pending"
+
+
+def _wait_for_pending_invite_absent(chatgpt_api, email: str, *, timeout: int = 30) -> bool:
+    target = _normalized_email(email)
+    deadline = time.time() + max(1, int(timeout))
+    while time.time() < deadline:
+        try:
+            _members, invites = fetch_team_state(chatgpt_api)
+            if not any(team_invite_email(invite) == target for invite in invites):
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def _cancel_stale_pending_invites_for_capacity(chatgpt_api, *, stage_label: str = "[Team]", mail_client=None) -> list[str]:
+    """Free capacity by cancelling stale AutoTeam-owned pending invites only."""
+    members, invites = fetch_team_state(chatgpt_api)
+    occupancy = len(members) + len(invites)
+    if occupancy < TEAM_SEATS_MAX or not invites:
+        return []
+
+    accounts = load_accounts()
+    accounts_by_email = {
+        _normalized_email(acc.get("email")): acc
+        for acc in accounts
+        if _normalized_email(acc.get("email"))
+    }
+    account_id = get_chatgpt_account_id()
+    cancelled: list[str] = []
+
+    logger.info(
+        "%s 远端席位满占用且存在 pending invite，尝试取消 AutoTeam 遗留邀请: members=%d invites=%d total=%d/%d",
+        stage_label,
+        len(members),
+        len(invites),
+        occupancy,
+        TEAM_SEATS_MAX,
+    )
+
+    for invite in invites:
+        email = team_invite_email(invite)
+        invite_id = _pending_invite_id(invite)
+        acc = accounts_by_email.get(email)
+        can_cancel, reason = _can_cancel_pending_invite(email, acc)
+        if not can_cancel:
+            logger.warning("%s 保留 pending invite: %s（%s）", stage_label, email or "unknown", reason)
+            continue
+        if not invite_id:
+            logger.warning("%s 无法取消 pending invite: %s（缺少 invite id）", stage_label, email)
+            continue
+
+        result = delete_team_invite(chatgpt_api, account_id, invite, invite_id=invite_id, email=email)
+        if result.get("status") not in (200, 204):
+            logger.warning("%s 取消 pending invite 失败: %s HTTP %s", stage_label, email, result.get("status"))
+            continue
+
+        cancelled.append(email)
+        logger.info("%s 已取消 stale pending invite: %s", stage_label, email)
+        if not _wait_for_pending_invite_absent(chatgpt_api, email):
+            logger.warning("%s pending invite 已提交取消但远端仍暂未消失: %s", stage_label, email)
+
+        if acc:
+            try:
+                delete_managed_account(
+                    email,
+                    remove_remote=False,
+                    remove_cloudmail=True,
+                    sync_cpa_after=False,
+                    chatgpt_api=chatgpt_api,
+                    mail_client=mail_client,
+                )
+            except Exception as exc:
+                logger.warning("%s 清理 pending invite 本地账号失败: %s (%s)", stage_label, email, exc)
+                try:
+                    _discard_auth_repair_failed_account_record(
+                        email,
+                        "stale_pending_invite_cancelled",
+                        status=STATUS_STANDBY,
+                    )
+                except Exception:
+                    pass
+
+        if len(members) + len(invites) - len(cancelled) < TEAM_SEATS_MAX:
+            break
+
+    if cancelled:
+        logger.info("%s 已释放 %d 个 pending invite 占位，下一步可创建新号", stage_label, len(cancelled))
+    return cancelled
+
+
 def _validate_managed_account_operational(
     email: str,
     *,
@@ -3626,6 +3885,207 @@ def _is_email_in_team(email):
     finally:
         if chatgpt:
             chatgpt.stop()
+
+
+def _wait_for_invite_link(mail_client, email: str, *, mail_account_id=None, timeout: int | None = None) -> str | None:
+    timeout = MAIL_TIMEOUT if timeout is None else max(1, int(timeout))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            emails = mail_client.search_emails_by_recipient(email, size=10, account_id=mail_account_id)
+        except TypeError:
+            emails = mail_client.search_emails_by_recipient(email, size=10)
+        except Exception as exc:
+            logger.warning("[邀请创建] 读取邀请邮件失败: %s", exc)
+            emails = []
+
+        for email_data in emails:
+            invite_link = mail_client.extract_invite_link(email_data)
+            if invite_link:
+                return invite_link
+
+        elapsed = max(0, int(timeout - (deadline - time.time())))
+        logger.info("[邀请创建] 等待邀请邮件: %s (%ds/%ds)", email, elapsed, timeout)
+        time.sleep(3)
+
+    return None
+
+
+def _cleanup_failed_created_account(
+    email: str | None,
+    mail_account_id,
+    mail_client,
+    reason: str,
+    *,
+    chatgpt_api=None,
+) -> None:
+    email = _normalized_email(email)
+    if not email:
+        return
+
+    logger.warning("[创建] 丢弃失败新账号: %s（%s）", email, reason)
+    try:
+        _discard_auth_repair_failed_account_record(email, reason, status=STATUS_STANDBY)
+    except Exception:
+        pass
+
+    try:
+        if chatgpt_api is not None and not _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.start()
+        delete_managed_account(
+            email,
+            remove_remote=True,
+            remove_cloudmail=True,
+            sync_cpa_after=False,
+            chatgpt_api=chatgpt_api,
+            mail_client=mail_client,
+        )
+        return
+    except Exception as exc:
+        logger.warning("[创建] delete_managed_account 清理失败: %s", exc)
+
+    if mail_account_id is not None:
+        try:
+            mail_client.delete_account(mail_account_id)
+        except Exception as exc:
+            logger.warning("[创建] 删除临时邮箱失败: %s", exc)
+    _release_account_ipv6_proxy(email)
+
+
+def create_account_via_invite(
+    chatgpt_api,
+    mail_client=None,
+    *,
+    leave_workspace=False,
+    out_outcome=None,
+    acc=None,
+):
+    """显式远端邀请 -> 邀请链接注册 -> 远端成员确认 -> Codex 凭证。"""
+    mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
+
+    if not _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.start()
+
+    if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[邀请创建]"):
+        return None
+
+    mail_account_id = None
+    email = None
+    try:
+        mail_account_id, email = mail_client.create_temp_email()
+    except Exception as exc:
+        logger.warning("[邀请创建] 创建临时邮箱失败: %s", exc)
+        return None
+
+    password = random_password()
+    provider_name = _mail_provider_name_for_client(mail_client)
+    add_account(
+        email,
+        password,
+        cloudmail_account_id=mail_account_id if provider_name == "cloudmail" else None,
+        workspace_account_id=get_chatgpt_account_id() or None,
+        mail_provider=provider_name,
+        mail_account_id=mail_account_id,
+    )
+
+    try:
+        auth_proxy_url, playwright_proxy_url = _ensure_account_ipv6_proxy(email)
+    except Exception as exc:
+        logger.warning("[邀请创建] IPv6 代理为必需但不可用，停止创建账号 %s: %s", email, exc)
+        _cleanup_failed_created_account(
+            email,
+            mail_account_id,
+            mail_client,
+            "ipv6_proxy_required_unavailable",
+            chatgpt_api=chatgpt_api,
+        )
+        return None
+
+    try:
+        if not _has_remote_capacity_for_new_seat(chatgpt_api, stage_label="[邀请创建]"):
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "remote_capacity_full_before_invite",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if not invite_to_team(chatgpt_api, email, seat_type="usage_based"):
+            logger.warning("[邀请创建] 发送 Team 邀请失败或被拒绝: %s", email)
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_rejected",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        invite_link = _wait_for_invite_link(mail_client, email, mail_account_id=mail_account_id)
+        if not invite_link:
+            logger.warning("[邀请创建] 未收到邀请链接: %s", email)
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_email_timeout",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.stop()
+
+        completed_email = _complete_registration(
+            email,
+            password,
+            invite_link,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            auth_proxy_url=auth_proxy_url,
+            playwright_proxy_url=playwright_proxy_url,
+        )
+        if not completed_email:
+            _cleanup_failed_created_account(
+                email,
+                mail_account_id,
+                mail_client,
+                "invite_registration_failed",
+                chatgpt_api=chatgpt_api,
+            )
+            return None
+
+        if not leave_workspace:
+            if not _chatgpt_session_ready(chatgpt_api):
+                chatgpt_api.start()
+            if not _wait_for_email_in_team(email, chatgpt_api=chatgpt_api, timeout=75, stage_label="[邀请创建]"):
+                _cleanup_failed_created_account(
+                    email,
+                    mail_account_id,
+                    mail_client,
+                    "remote_member_not_visible",
+                    chatgpt_api=chatgpt_api,
+                )
+                return None
+
+        logger.info("[邀请创建] 新账号已完成邀请注册: %s", email)
+        ready_acc = find_account(load_accounts(), email)
+        _sync_ready_credential_to_targets(email, (ready_acc or {}).get("auth_file"), stage_label="[邀请创建]")
+        return email
+    except Exception as exc:
+        logger.warning("[邀请创建] 新账号创建异常: %s", exc)
+        _cleanup_failed_created_account(
+            email,
+            mail_account_id,
+            mail_client,
+            "invite_create_exception",
+            chatgpt_api=chatgpt_api,
+        )
+        return None
 
 
 _DIRECT_EMAIL_SELECTORS = (
@@ -5053,13 +5513,17 @@ def create_new_account(
 
     Round 12 S4: `mail_client` 改为可选 — 缺省时按 acc 路由 / 走 get_mail_client()。
     """
-    # 先检查 pending invites
     mail_client = _resolve_mail_client_or_default(mail_client, acc=acc)
     try:
         from autoteam.config import ROTATE_SKIP_REUSE
     except Exception:
         ROTATE_SKIP_REUSE = False
 
+    mode = _runtime_new_account_mode()
+    fallback_invite = _domain_auto_join_fallback_invite_enabled()
+    direct_attempted = False
+
+    # 先检查 pending invites
     if chatgpt_api and _chatgpt_session_ready(chatgpt_api) and not ROTATE_SKIP_REUSE:
         logger.info("[创建] 先检查 pending invites...")
         completed = _check_pending_invites(
@@ -5074,8 +5538,67 @@ def create_new_account(
     elif chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         logger.info("[创建] ROTATE_SKIP_REUSE 启用：跳过历史 pending invite，只创建新账号")
 
-    # 直接注册模式（不需要邀请）
-    logger.info("[创建] 使用直接注册模式...")
+    auto_join_allowed = mode == "direct_first" or (
+        mode == "domain_auto_join_first" and _mail_domain_auto_join_allowed(mail_client)
+    )
+    if mode == "domain_auto_join_first" and not auto_join_allowed:
+        logger.warning(
+            "[创建] path=domain_auto_join 跳过：当前邮箱域名不在 AUTOTEAM_AUTO_JOIN_DOMAINS 中，改用邀请路径"
+        )
+
+    if auto_join_allowed:
+        logger.info(
+            "[创建] path=domain_auto_join mode=%s fallback_invite=%s：跳过邀请邮件，直接注册并等待远端成员确认",
+            mode,
+            fallback_invite,
+        )
+        if chatgpt_api is not None:
+            if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[直接注册]"):
+                logger.warning("[创建] path=domain_auto_join 远端席位不可用，停止直接注册")
+                return None
+            if _chatgpt_session_ready(chatgpt_api):
+                chatgpt_api.stop()
+
+        direct_attempted = True
+        direct_email = create_account_direct(
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+            path_rotator=path_rotator,
+            parallel=parallel,
+        )
+        if direct_email:
+            return direct_email
+        if not fallback_invite:
+            logger.warning("[创建] path=domain_auto_join 失败且 fallback invite 已关闭")
+            return None
+        logger.warning("[创建] path=domain_auto_join 失败，尝试 path=invite_fallback")
+
+    if chatgpt_api is not None and (auto_join_allowed or mode == "invite_first" or _chatgpt_session_ready(chatgpt_api)):
+        invite_path = "invite_fallback" if auto_join_allowed else "invite_legacy"
+        logger.info(
+            "[创建] path=%s 使用远端邀请注册模式（members+invites 先验容量，注册后确认远端成员）...",
+            invite_path,
+        )
+        invited_email = create_account_via_invite(
+            chatgpt_api,
+            mail_client,
+            leave_workspace=leave_workspace,
+            out_outcome=out_outcome,
+            acc=acc,
+        )
+        if invited_email:
+            return invited_email
+        if direct_attempted:
+            logger.warning("[创建] path=invite_fallback 失败，direct 注册已经尝试过，停止本轮新号创建")
+            return None
+        logger.warning("[创建] 远端邀请注册模式失败，尝试直接注册兜底（仍要求远端成员确认）...")
+        if not _prepare_remote_capacity_for_new_seat(chatgpt_api, stage_label="[创建兜底]"):
+            logger.warning("[创建] 远端席位已满或有 pending invite 占位，跳过直接注册兜底")
+            return None
+
+    logger.info("[创建] path=direct_fallback 使用直接注册兜底模式...")
     if chatgpt_api and _chatgpt_session_ready(chatgpt_api):
         chatgpt_api.stop()
     return create_account_direct(

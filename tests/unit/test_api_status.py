@@ -671,3 +671,51 @@ def test_post_setup_save_keeps_cpa_url_required_and_generates_api_key(monkeypatc
     assert written["API_KEY"] == "generated-token"
     assert result["api_key"] == "generated-token"
     assert api.API_KEY == "generated-token"
+
+
+def test_post_setup_save_normalizes_rotation_account_strategy(monkeypatch):
+    written = {}
+
+    def fake_write_env(key, value):
+        written[key] = value
+
+    monkeypatch.setattr("autoteam.setup_wizard._write_env", fake_write_env)
+    monkeypatch.setattr("autoteam.setup_wizard._verify_cloudmail", lambda: True)
+    monkeypatch.setattr("autoteam.setup_wizard._verify_cpa", lambda: True)
+    monkeypatch.setattr("importlib.reload", lambda module: module)
+    monkeypatch.setattr(api, "API_KEY", "old-key")
+    monkeypatch.setenv("API_KEY", "old-key")
+
+    result = api.post_setup_save(
+        api.SetupConfig(
+            CLOUDMAIL_BASE_URL="http://mail.example.com",
+            CLOUDMAIL_PASSWORD="secret",
+            CLOUDMAIL_DOMAIN="@example.com",
+            CPA_URL="http://127.0.0.1:8317",
+            CPA_KEY="key-1",
+            API_KEY="old-key",
+            ROTATE_NEW_ACCOUNT_MODE="DOMAIN_AUTO_JOIN_FIRST",
+            AUTOTEAM_AUTO_JOIN_DOMAINS="@Example.com, other.example.",
+            ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=True,
+        )
+    )
+
+    assert result["message"] == "配置保存成功"
+    assert written["ROTATE_NEW_ACCOUNT_MODE"] == "domain_auto_join_first"
+    assert written["AUTOTEAM_AUTO_JOIN_DOMAINS"] == "example.com,other.example"
+    assert written["ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE"] == "true"
+
+
+def test_post_setup_save_rejects_invalid_rotation_account_strategy(monkeypatch):
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _n: "generated-token")
+
+    result = api.post_setup_save(
+        api.SetupConfig(
+            ROTATE_NEW_ACCOUNT_MODE="invite-maybe",
+            ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE="maybe",
+        )
+    )
+
+    assert result.status_code == 400
+    body = json.loads(result.body.decode("utf-8"))
+    assert body["message"] == "ROTATE_NEW_ACCOUNT_MODE 必须是 domain_auto_join_first、invite_first 或 direct_first"

@@ -280,6 +280,9 @@ class SetupConfig(BaseModel):
     MAILLAB_DOMAIN: str = ""
     CPA_URL: str = "http://127.0.0.1:8317"
     CPA_KEY: str = ""
+    ROTATE_NEW_ACCOUNT_MODE: str = "domain_auto_join_first"
+    AUTOTEAM_AUTO_JOIN_DOMAINS: str = "auto"
+    ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE: str | bool = "true"
     PLAYWRIGHT_PROXY_URL: str = ""
     PLAYWRIGHT_PROXY_BYPASS: str = ""
     API_KEY: str = ""
@@ -385,6 +388,41 @@ class DNSDiagnosticResponse(BaseModel):
 
 _CF_MAIL_KEYS = {"CLOUDMAIL_BASE_URL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_DOMAIN"}
 _MAILLAB_KEYS = {"MAILLAB_API_URL", "MAILLAB_USERNAME", "MAILLAB_PASSWORD", "MAILLAB_DOMAIN"}
+_ROTATE_NEW_ACCOUNT_MODES = {"domain_auto_join_first", "invite_first", "direct_first"}
+
+
+def _normalize_setup_bool(value, *, field: str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled", "y", "t"}:
+        return "true"
+    if text in {"0", "false", "no", "off", "disabled", "n", "f"}:
+        return "false"
+    raise ValueError(f"{field} 必须是 true 或 false")
+
+
+def _normalize_rotation_setup_values(data: dict) -> None:
+    mode = str(data.get("ROTATE_NEW_ACCOUNT_MODE", "") or "").strip().lower()
+    if mode:
+        if mode not in _ROTATE_NEW_ACCOUNT_MODES:
+            raise ValueError("ROTATE_NEW_ACCOUNT_MODE 必须是 domain_auto_join_first、invite_first 或 direct_first")
+        data["ROTATE_NEW_ACCOUNT_MODE"] = mode
+
+    domains = str(data.get("AUTOTEAM_AUTO_JOIN_DOMAINS", "") or "").strip()
+    if domains:
+        data["AUTOTEAM_AUTO_JOIN_DOMAINS"] = ",".join(
+            part.strip().lower().lstrip("@").rstrip(".")
+            for part in domains.split(",")
+            if part.strip()
+        ) or "auto"
+    else:
+        data["AUTOTEAM_AUTO_JOIN_DOMAINS"] = ""
+
+    data["ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE"] = _normalize_setup_bool(
+        data.get("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "true"),
+        field="ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE",
+    )
 
 
 @app.get("/api/setup/status")
@@ -423,6 +461,10 @@ def post_setup_save(config: SetupConfig):
         data["CPA_URL"] = defaults.get("CPA_URL", "http://127.0.0.1:8317")
     if not data.get("API_KEY"):
         data["API_KEY"] = _secrets.token_urlsafe(24)
+    try:
+        _normalize_rotation_setup_values(data)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"message": str(exc), "api_key": data["API_KEY"]})
 
     # SPEC-1 §3.6 — 按 provider 互斥写入,避免无关字段污染 .env
     provider = (data.get("MAIL_PROVIDER") or "cf_temp_email").strip().lower()
@@ -434,7 +476,7 @@ def post_setup_save(config: SetupConfig):
     else:
         skip_keys = set()
 
-    clearable_fields = {"PLAYWRIGHT_PROXY_URL", "PLAYWRIGHT_PROXY_BYPASS"}
+    clearable_fields = {"AUTOTEAM_AUTO_JOIN_DOMAINS", "PLAYWRIGHT_PROXY_URL", "PLAYWRIGHT_PROXY_BYPASS"}
     for key, value in data.items():
         if key in skip_keys:
             continue

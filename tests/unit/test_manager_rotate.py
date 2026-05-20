@@ -124,6 +124,99 @@ def test_replaceable_pool_blocker_reason_reports_concrete_evidence():
     )
 
 
+def test_create_new_account_uses_domain_auto_join_before_invite(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
+    monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
+    monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        manager,
+        "create_account_via_invite",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invite should not run for auto-join domain")),
+    )
+    monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or "new@example.com")
+
+    result = manager.create_new_account(chatgpt, _FakeMailClient())
+
+    assert result == "new@example.com"
+    assert events == ["direct"]
+    assert chatgpt.stopped == 1
+
+
+def test_create_new_account_invite_first_mode_preserves_invite_order(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "invite_first")
+    monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
+    monkeypatch.setattr(
+        manager,
+        "create_account_direct",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct should not run when invite succeeds")),
+    )
+
+    result = manager.create_new_account(chatgpt, _FakeMailClient())
+
+    assert result == "new@example.com"
+    assert events == ["invite"]
+
+
+def test_create_new_account_domain_auto_join_falls_back_to_invite(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
+    monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
+    monkeypatch.setenv("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", "true")
+    monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
+    monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
+
+    result = manager.create_new_account(chatgpt, _FakeMailClient())
+
+    assert result == "new@example.com"
+    assert events == ["direct", "invite"]
+
+
+def test_create_new_account_does_not_retry_direct_after_invite_fallback_failure(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
+    monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "example.com")
+    monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(manager, "_prepare_remote_capacity_for_new_seat", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(manager, "create_account_direct", lambda *_args, **_kwargs: events.append("direct") or None)
+    monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or None)
+
+    assert manager.create_new_account(chatgpt, _FakeMailClient()) is None
+    assert events == ["direct", "invite"]
+
+
+def test_create_new_account_domain_auto_join_respects_allowlist(monkeypatch):
+    chatgpt = _FakeChatGPT()
+    events = []
+
+    monkeypatch.setenv("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
+    monkeypatch.setenv("AUTOTEAM_AUTO_JOIN_DOMAINS", "other.example")
+    monkeypatch.setattr(manager, "get_mail_domain", lambda: "@example.com")
+    monkeypatch.setattr(
+        manager,
+        "create_account_direct",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct should not run for unlisted domain")),
+    )
+    monkeypatch.setattr(manager, "create_account_via_invite", lambda *_args, **_kwargs: events.append("invite") or "new@example.com")
+
+    result = manager.create_new_account(chatgpt, _FakeMailClient())
+
+    assert result == "new@example.com"
+    assert events == ["invite"]
+
+
 def test_cmd_rotate_removes_replaceable_blocker_before_creating_replacement(monkeypatch):
     import autoteam.config as config
 

@@ -31,8 +31,11 @@ cp .env.example .env
 | `MULTI_MASTER_BROWSER_BUDGET` | owner 并发与 direct signup race 共用的全局浏览器预算 | 否（默认 `4`） |
 | `MULTI_MASTER_MEMORY_DOWNGRADE_RATIO` | cgroup 内存比例达到该值时，多母号并行自动降级为串行 | 否（默认 `0.85`） |
 | `DIRECT_REGISTER_PARALLEL` | 单个注册目标的 direct signup race 预算，当前多母号切片先用于预算/可观测 | 否（默认 `1`） |
-| `RECONCILE_KICK_ORPHAN` | 对账发现"残废"成员(workspace 有 active + 本地 `auth_file` 缺失)时是否自动 KICK。关掉则标记 `STATUS_ORPHAN` 等人工处理 | 否（默认 `true`） |
-| `RECONCILE_KICK_GHOST` | 对账发现"ghost"成员(workspace 有但本地完全无记录)时是否自动 KICK。关掉则留给 `sync_account_states` 反向补录 | 否（默认 `true`） |
+| `ROTATE_NEW_ACCOUNT_MODE` | 新号创建策略：`domain_auto_join_first` / `invite_first` / `direct_first` | 否（默认 `domain_auto_join_first`） |
+| `AUTOTEAM_AUTO_JOIN_DOMAINS` | 允许免邀请自动入工作空间的邮箱域名；`auto` 表示当前邮箱服务域名，多个用逗号分隔 | 否（默认 `auto`） |
+| `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE` | direct 注册未能远端确认入席时是否回退邀请链接注册 | 否（默认 `true`） |
+| `RECONCILE_KICK_ORPHAN` | 对账发现“残废”成员(workspace 有 active + 本地 `auth_file` 缺失)时是否自动 KICK。关掉则标记 `STATUS_ORPHAN` 等人工处理 | 否（默认 `true`） |
+| `RECONCILE_KICK_GHOST` | 对账发现“ghost”成员(workspace 有但本地完全无记录)时是否自动 KICK。关掉则留给 `sync_account_states` 反向补录 | 否（默认 `true`） |
 
 ## 账号状态与席位字段
 
@@ -146,6 +149,24 @@ PLAYWRIGHT_PROXY_URL=socks5://username:password@host.docker.internal:1080
 
 - `PLAYWRIGHT_PROXY_URL` 会被解析为 Playwright 所需的 `server` / `username` / `password` 字段
 - `PLAYWRIGHT_PROXY_BYPASS` 建议至少包含 `localhost,127.0.0.1`，避免本地回调或容器内本地服务误走代理
+
+## 轮转新号创建策略
+
+如果 ChatGPT workspace 已完成 Verified Domains，并在 Workspace -> Identity & Access 开启 Automatic account creation，建议保留默认策略：
+
+```dotenv
+ROTATE_NEW_ACCOUNT_MODE=domain_auto_join_first
+AUTOTEAM_AUTO_JOIN_DOMAINS=auto
+ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=true
+```
+
+行为说明：
+
+- `domain_auto_join_first` 会先确认当前邮箱服务域名在 allowlist 内，然后跳过 Team invite 和邀请邮件等待，直接注册 ChatGPT 账号。
+- direct 注册成功后仍必须通过远端 Team members、本地 auth file 和 Codex quota 验收；未确认不会被当作可用 active 账号。
+- direct 注册失败且 `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=true` 时，会回退到邀请链接注册路径。
+- 如果邮箱域名还没有完成 verified domain / automatic account creation，请改为 `ROTATE_NEW_ACCOUNT_MODE=invite_first`。
+- `direct_first` 是强制模式，只建议在确认所有临时邮箱域名都能自动加入 workspace 时使用。
 
 ### 内联注释
 

@@ -222,3 +222,97 @@ else:
 ```
 
 Creation, Team membership, local auth, and quota are separate facts. A child becomes usable only after all are validated.
+
+## Scenario: Rotation New Account Strategy and Invite Fallback
+
+### 1. Scope / Trigger
+
+- Trigger: any change to `create_new_account(...)`, `create_account_via_invite(...)`, pending invite cleanup, or the setup/runtime keys `ROTATE_NEW_ACCOUNT_MODE`, `AUTOTEAM_AUTO_JOIN_DOMAINS`, and `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE`.
+- Goal: prefer verified-domain automatic workspace join when it is safe, while preserving the explicit invite-link registration path for workspaces that cannot auto-join.
+
+### 2. Signatures
+
+- `ROTATE_NEW_ACCOUNT_MODE: domain_auto_join_first | invite_first | direct_first`.
+- `AUTOTEAM_AUTO_JOIN_DOMAINS: auto | * | <comma-separated domains>`.
+- `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE: bool`, default `true`.
+- `create_new_account(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None, path_rotator=None, parallel=None)`.
+- `create_account_via_invite(chatgpt_api, mail_client=None, *, leave_workspace=False, out_outcome=None, acc=None)`.
+- `_prepare_remote_capacity_for_new_seat(chatgpt_api, *, stage_label="[创建]") -> bool`.
+- `_cancel_stale_pending_invites_for_capacity(chatgpt_api, *, stage_label="[Team]", mail_client=None) -> list[str]`.
+
+### 3. Contracts
+
+- Valid `ROTATE_NEW_ACCOUNT_MODE` values are:
+  - `domain_auto_join_first` (default): direct signup first only when the current mail domain is in `AUTOTEAM_AUTO_JOIN_DOMAINS`.
+  - `invite_first`: use explicit Team invite and invitation-link registration first.
+  - `direct_first`: force direct signup first without domain allowlist gating.
+- `AUTOTEAM_AUTO_JOIN_DOMAINS=auto` means the current mail provider domain set, including runtime `register_domain`, `CLOUDMAIL_DOMAIN`, `MAILLAB_DOMAIN`, and supported provider-specific domain envs.
+- `AUTOTEAM_AUTO_JOIN_DOMAINS=*` allows direct-first behavior for all provider domains, but should only be used after verified-domain auto-join has been confirmed.
+- Direct signup may run only after remote capacity is checked. If Team members plus pending invites occupy the hard 3-seat cap, cancel only AutoTeam-owned stale pending invites; never cancel main-account, protected-auth, or external/manual invites.
+- Direct signup success is not enough to count a child as usable. Fill/rotate must still validate remote Team member presence, local auth file, and Codex quota before incrementing active capacity.
+- If `domain_auto_join_first` direct signup fails and `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE=true`, the next path is invite-link registration. If that invite fallback also fails, do not retry direct in the same cycle.
+- If the mail domain is not allowed for `domain_auto_join_first`, skip direct signup and use the invite path. This keeps non-verified domains from producing free/personal accounts that never join the Team.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| `ROTATE_NEW_ACCOUNT_MODE` is missing or invalid at runtime | Warn and fall back to `domain_auto_join_first` |
+| setup save receives invalid `ROTATE_NEW_ACCOUNT_MODE` | return HTTP 400 and do not persist the invalid value |
+| setup save receives non-boolean `ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE` | return HTTP 400 and do not persist the invalid value |
+| `AUTOTEAM_AUTO_JOIN_DOMAINS=auto` | derive the allowlist from the configured mail provider domains |
+| `AUTOTEAM_AUTO_JOIN_DOMAINS=*` | allow direct-first auto-join for all domains |
+| `domain_auto_join_first` with unlisted mail domain | skip direct signup and use invite-link registration |
+| direct auto-join fails and invite fallback is enabled | try invite-link registration once |
+| direct auto-join fails and invite fallback is disabled | stop the cycle without inviting |
+| invite fallback fails after direct already ran | stop the cycle without retrying direct |
+| remote members plus pending invites reach the 3-seat cap | cancel only AutoTeam-owned stale pending invites before any new account creation |
+| pending invite belongs to main/protected/external account | keep it and do not free capacity by deleting it |
+
+### 5. Good/Base/Bad Cases
+
+- Good: `AUTOTEAM_AUTO_JOIN_DOMAINS=auto` with a verified CloudMail domain runs direct signup before invite, then the created child must still pass remote/auth/quota validation.
+- Good: a full remote Team with one stale AutoTeam-owned pending invite cancels that invite first, waits for capacity, and only then creates a replacement.
+- Base: `invite_first` preserves the explicit invite-link flow for workspaces where verified-domain auto-join is not available.
+- Bad: creating a direct-signup child for an unlisted domain, because it can become a free/personal account outside the Team.
+- Bad: deleting pending invites that belong to the main account, protected local auth, or manually-created external users.
+- Bad: retrying direct signup again after an invite fallback failure in the same cycle.
+
+### 6. Tests Required
+
+- `tests/unit/test_manager_rotate.py`
+  - domain auto-join allowlist runs direct before invite.
+  - `invite_first` preserves invite-link registration order.
+  - failed domain auto-join falls back to invite when enabled.
+  - invite fallback failure does not retry direct again.
+  - unlisted mail domain skips direct and uses invite.
+- `tests/unit/test_api_status.py`
+  - setup save normalizes the three rotation strategy fields.
+  - invalid mode/bool values are rejected before writing `.env`.
+
+### 7. Wrong vs Correct
+
+#### Wrong
+
+```python
+created = create_account_direct(mail_client)
+if not created:
+    created = create_account_via_invite(chatgpt_api, mail_client)
+if not created:
+    created = create_account_direct(mail_client)
+```
+
+This ignores the verified-domain allowlist, can create non-Team free accounts for unsupported domains, and retries direct after invite fallback has already failed.
+
+#### Correct
+
+```python
+if mode == "domain_auto_join_first" and _mail_domain_auto_join_allowed(mail_client):
+    created = create_account_direct(mail_client, parallel=parallel)
+    if created or not _domain_auto_join_fallback_invite_enabled():
+        return created
+    return create_account_via_invite(chatgpt_api, mail_client)
+return create_account_via_invite(chatgpt_api, mail_client)
+```
+
+Gate direct signup on the configured domain policy, preserve invite-first behavior, and keep each registration path to one attempt per cycle.

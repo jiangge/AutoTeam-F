@@ -46,6 +46,13 @@ def _normalize_sub2api_ws_mode(value: str) -> str:
     return "off"
 
 
+def _normalize_rotate_new_account_mode(value: str) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"domain_auto_join_first", "invite_first", "direct_first"}:
+        return mode
+    return "domain_auto_join_first"
+
+
 # CloudMail 配置
 CLOUDMAIL_BASE_URL = os.environ.get("CLOUDMAIL_BASE_URL", "")
 CLOUDMAIL_EMAIL = os.environ.get("CLOUDMAIL_EMAIL", "")
@@ -108,6 +115,11 @@ AUTO_CHECK_ADD_PHONE_MAX_RETRIES = _get_int_env("AUTO_CHECK_ADD_PHONE_MAX_RETRIE
 
 # 默认不复用旧/失败/退役子号。Team 满员需要替换时必须先移出旧 child，再创建新 child。
 ROTATE_SKIP_REUSE = _get_bool_env("ROTATE_SKIP_REUSE", True)
+ROTATE_NEW_ACCOUNT_MODE = _normalize_rotate_new_account_mode(
+    _get_str_env("ROTATE_NEW_ACCOUNT_MODE", "domain_auto_join_first")
+)
+AUTOTEAM_AUTO_JOIN_DOMAINS = _get_str_env("AUTOTEAM_AUTO_JOIN_DOMAINS", "auto")
+ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE = _get_bool_env("ROTATE_DOMAIN_AUTO_JOIN_FALLBACK_INVITE", True)
 ROTATE_MAX_DURATION = max(60, _get_int_env("ROTATE_MAX_DURATION", 1500))
 
 
