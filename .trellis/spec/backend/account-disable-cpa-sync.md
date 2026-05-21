@@ -28,6 +28,7 @@
 - Disabled rows must be excluded from `get_active_accounts()` and `get_standby_accounts()`.
 - Auto-check and rotation candidate selection must treat disabled rows as unavailable.
 - `sync_to_cpa()` must not upload disabled accounts.
+- `STATUS_DEGRADED_GRACE` accounts are non-publishable for remote sync: full CPA sync must not upload them, and single-credential sync must return `account_not_active` instead of uploading to CPA/Sub2API. Existing remote CPA copies may be removed only through the normal remote-delete guard when the active pool is stable.
 - A disabled account's local auth file is still protected from accidental CPA remote deletion by the existing same-file delete guard.
 
 ### 4. Validation & Error Matrix
@@ -58,7 +59,10 @@
   - `/api/status` skips disabled quota checks and counts disabled rows.
 - `tests/unit/test_cpa_sync.py`
   - Disabled account is skipped for CPA upload.
+  - `STATUS_DEGRADED_GRACE` account is skipped for CPA upload.
   - Matching remote auth file is retained by delete guard.
+- `tests/unit/test_sync_targets.py`
+  - `STATUS_DEGRADED_GRACE` single-credential sync skips CPA/Sub2API upload with `account_not_active`.
 
 ### 7. Wrong vs Correct
 

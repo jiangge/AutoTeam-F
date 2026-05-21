@@ -108,3 +108,35 @@ def test_sync_account_to_configured_targets_skips_non_active_auth(monkeypatch, t
     assert result["ok"] is False
     assert result["skipped"] is True
     assert result["reason"] == "account_not_active"
+
+
+def test_sync_account_to_configured_targets_skips_degraded_grace_auth(monkeypatch, tmp_path):
+    auth_file = tmp_path / "codex-grace@example.com-team-a.json"
+    auth_file.write_text('{"access_token":"token"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "grace@example.com", "status": "degraded_grace", "auth_file": str(auth_file)}],
+    )
+    monkeypatch.setattr(
+        sync_targets,
+        "get_enabled_sync_targets",
+        lambda: [sync_targets.SYNC_TARGET_CPA, sync_targets.SYNC_TARGET_SUB2API],
+    )
+    monkeypatch.setattr(
+        "autoteam.cpa_sync.upload_to_cpa",
+        lambda _path: (_ for _ in ()).throw(AssertionError("grace account must not upload to CPA")),
+    )
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.sync_account_to_sub2api",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("grace account must not upload to Sub2API")
+        ),
+    )
+
+    result = sync_targets.sync_account_to_configured_targets("grace@example.com", str(auth_file))
+
+    assert result["ok"] is False
+    assert result["skipped"] is True
+    assert result["reason"] == "account_not_active"
+    assert result["status"] == "degraded_grace"

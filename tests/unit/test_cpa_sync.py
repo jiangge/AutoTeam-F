@@ -94,6 +94,66 @@ def test_sync_to_cpa_skips_disabled_accounts_and_keeps_protected_remote(monkeypa
     assert result["delete_guard"]["skipped_remote_delete"] == 1
 
 
+def test_sync_to_cpa_does_not_upload_degraded_grace_accounts(monkeypatch, tmp_path):
+    first_auth = tmp_path / "codex-first@example.com-team-a.json"
+    second_auth = tmp_path / "codex-second@example.com-team-b.json"
+    grace_auth = tmp_path / "codex-grace@example.com-team-c.json"
+    first_auth.write_text('{"access_token":"token-first"}', encoding="utf-8")
+    second_auth.write_text('{"access_token":"token-second"}', encoding="utf-8")
+    grace_auth.write_text('{"access_token":"token-grace"}', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "first@example.com",
+                "status": "active",
+                "auth_file": str(first_auth),
+                "disabled": False,
+            },
+            {
+                "email": "second@example.com",
+                "status": "active",
+                "auth_file": str(second_auth),
+                "disabled": False,
+            },
+            {
+                "email": "grace@example.com",
+                "status": "degraded_grace",
+                "auth_file": str(grace_auth),
+                "disabled": False,
+                "mail_provider": "cf_temp_email",
+                "mail_account_id": "mail-grace",
+            },
+        ],
+    )
+    monkeypatch.setattr("autoteam.accounts.save_accounts", lambda _accounts: None)
+    monkeypatch.setattr(cpa_sync, "_cleanup_local_duplicates", lambda _accounts: (0, False))
+    monkeypatch.setattr(
+        cpa_sync,
+        "list_cpa_files",
+        lambda: [
+            {"name": first_auth.name, "email": "first@example.com"},
+            {"name": second_auth.name, "email": "second@example.com"},
+            {"name": grace_auth.name, "email": "grace@example.com"},
+        ],
+    )
+
+    uploaded = []
+    deleted = []
+    monkeypatch.setattr("autoteam.codex_auth.check_codex_quota", lambda *_args, **_kwargs: ("ok", {}))
+    monkeypatch.setattr(cpa_sync, "upload_to_cpa", lambda path: uploaded.append(Path(path).name) or True)
+    monkeypatch.setattr(cpa_sync, "delete_from_cpa", lambda name: deleted.append(name) or True)
+
+    result = cpa_sync.sync_to_cpa()
+
+    assert uploaded == [first_auth.name, second_auth.name]
+    assert grace_auth.name not in uploaded
+    assert deleted == [grace_auth.name]
+    assert result["synced_active"] == 2
+    assert result["delete_guard"]["allow_remote_delete"] is True
+
+
 def test_sync_to_cpa_allows_remote_delete_when_active_pool_is_stable(monkeypatch, tmp_path):
     first_auth = tmp_path / "codex-first@example.com-team-a.json"
     second_auth = tmp_path / "codex-second@example.com-team-b.json"
