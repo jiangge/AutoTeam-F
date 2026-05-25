@@ -372,6 +372,51 @@ def test_create_account_direct_reuses_signup_profile_for_register_and_oauth(monk
     assert captured["oauth"]["leave_workspace"] is True
 
 
+def test_create_account_direct_returns_none_when_post_oauth_not_ready(monkeypatch):
+    profile = SignupProfile(
+        full_name="Nolan Price",
+        birthday={"year": "1990", "month": "05", "day": "04"},
+        age="36",
+    )
+    release_calls = []
+
+    class _FakeMailClient:
+        pass
+
+    monkeypatch.setattr(
+        manager_mod,
+        "_attempt_chatgpt_signup_only",
+        lambda *_args, **_kwargs: {
+            "success": True,
+            "email": "not-ready@example.com",
+            "password": "Password123!",
+            "account_id": "mail-id",
+            "session_token": "session-token",
+            "signup_profile": profile,
+            "auth_proxy_url": "http://auth-proxy",
+            "playwright_proxy_url": "http://playwright-proxy",
+            "mail_client": _FakeMailClient(),
+        },
+    )
+    monkeypatch.setattr(manager_mod, "add_account", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(manager_mod, "get_chatgpt_account_id", lambda: "workspace-account")
+    monkeypatch.setattr(
+        manager_mod,
+        "_run_post_register_oauth",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "_release_account_ipv6_proxy",
+        lambda email: release_calls.append(email),
+    )
+
+    result = manager_mod.create_account_direct(mail_client=_FakeMailClient(), leave_workspace=False, parallel=1)
+
+    assert result is None
+    assert release_calls == ["not-ready@example.com"]
+
+
 def test_direct_register_step_recognizes_auth_error_page(monkeypatch):
     page = type("_Page", (), {"url": "https://chatgpt.com/api/auth/error"})()
 

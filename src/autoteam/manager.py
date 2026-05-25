@@ -3631,13 +3631,14 @@ def _run_post_register_oauth(
     # 之前误用 STATUS_ACTIVE 让 auth_file 缺失的"半残账号"被 active 计数器忽略(api.py:_auto_check_loop
     # 过滤 auth_file 存在),导致 cmd_rotate 每 30 分钟重复触发 fill 累积僵尸账号。
     # 改 STATUS_AUTH_INVALID 后 reconcile 会按 auth_invalid 接管(KICK Team workspace + 清本地)。
-    # 上游 cmd_fill 仍依 `if email: produced+=1` 按席位计数,所以这里仍返回 email(语义不变);
-    # outcome 仍打 team_auth_missing 让汇总能显示"这批里有 X 个需要补登录"。
+    # Registration success is not enough: callers must see failure when the
+    # account has no ready Codex credential bundle, otherwise fill/rotate can
+    # count a half-registered Team seat as usable.
     update_account(email, status=STATUS_AUTH_INVALID, workspace_account_id=get_chatgpt_account_id() or None)
     _kick_team_seat_after_oauth_failure(email, reason="bundle_missing")
     logger.warning("[注册] 账号已加入 Team 但 Codex 登录失败,标 AUTH_INVALID 待 reconcile: %s", email)
     _record_outcome("team_auth_missing", reason="已入 Team 席位但 Codex OAuth 未返回 bundle,需要补登录")
-    return email
+    return None
 
 
 def _get_mail_client_for_account(acc):

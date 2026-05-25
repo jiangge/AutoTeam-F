@@ -155,8 +155,8 @@ class TestRunPostRegisterOauthKicksWs:
             f"bundle_missing 分支 reason 必须为 'bundle_missing',实际: {call.kwargs.get('reason')}"
         )
 
-        # 行为不变:仍然 return email + outcome=team_auth_missing
-        assert result == "bm@x.com"
+        # OAuth bundle 缺失不再算注册成功，避免无凭证账号被上游计数。
+        assert result is None
         assert out.get("status") == "team_auth_missing"
 
         # 状态仍然是 AUTH_INVALID(防回归)

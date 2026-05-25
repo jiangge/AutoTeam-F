@@ -35,7 +35,7 @@ class TestRunPostRegisterOauthTeamNoBundle:
 
     def test_run_post_register_oauth_team_no_bundle_marks_auth_invalid(self, tmp_path, monkeypatch):
         """Team 分支 login_codex_via_browser 返回 None → update_account(status=AUTH_INVALID),
-        且仍然 return email 让 cmd_fill produced+=1 计数生效。"""
+        且 return None，避免把无 Codex credential 的账号计为注册成功。"""
         from autoteam import accounts as accounts_mod
         from autoteam import manager
 
@@ -76,9 +76,9 @@ class TestRunPostRegisterOauthTeamNoBundle:
                             out_outcome=out,
                         )
 
-        # 仍然 return email 让 cmd_fill 按席位计数 +1(行为不变)
-        assert result == "team_no_bundle@x.com"
-        # outcome 仍打 team_auth_missing(行为不变)
+        # 最新注册流程要求 credential/OAuth ready 才能计为成功。
+        assert result is None
+        # outcome 仍打 team_auth_missing，方便上游汇总诊断。
         assert out.get("status") == "team_auth_missing"
 
         # ★ 修复 1 关键断言:status 必须是 AUTH_INVALID 不是 ACTIVE
