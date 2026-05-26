@@ -57,6 +57,8 @@
 - `cmd_check(include_standby=False, *, force_auth_repair=False, preserve_low_active=False, preserved_low_accounts=None) -> list`
 - `_historical_low_quota_info(acc, threshold, now=None) -> dict | None`
 - `_record_auth_repair_failure(email, error_type=None, error_detail=None, *, chatgpt_api=None) -> dict`
+- `_can_replace_protected_managed_auth_failure(acc, *, error_type=None, reason=None, missing_auth=False) -> bool`
+- `_should_aggressively_release_auth_failure(error_type, *, discard_failed_repair) -> bool`
 - `_discard_auth_repair_failed_account_record(email, reason, *, status=STATUS_STANDBY, now=None) -> None`
 - `cmd_rotate(target_seats=3, force_auth_repair=False, background_post_sync=False)`
 - `IPv6Pool.start(active_emails: Iterable[str] | None = None) -> None`
@@ -114,6 +116,7 @@
 - `_record_auth_repair_failure()` must preserve current state-machine semantics: final auth-pending state is persisted as `STATUS_AUTH_INVALID`, and status writes may include `_reason` for transition logging.
 - `_record_auth_repair_failure()` may release a Team blocker after repeated `email_verification` exhausts the retry budget, and may release missing-auth `login_state_lost` / organization-selection blockers when they occupy a Team seat.
 - Protected local credential seats (`protect_team_seat=True` or a non-provider local auth file) must not be released by `login_state_lost`; they should pause repair and stay in the current auth-pending state.
+- Protected AutoTeam-managed child seats with a mail binding (`mail_account_id` or `cloudmail_account_id`) are different from manual/local credential seats. If concrete auth-failure evidence exists (`auth_error_discard`, `missing_auth_file`, `auth_retry_paused`, `auth_retry_after`, `non_team_plan`, `oauth_timeout`, `login_failed`, etc.), `_can_replace_protected_managed_auth_failure()` may override stale protection flags so rotation can release/retire the child and restore capacity.
 - When an auth-repair failure successfully releases a Team seat and `ROTATE_SKIP_REUSE=true`, the local row should be retained for evidence but marked `disabled=True`, `reuse_disabled=True`, and `retired_reason="auth_repair_failed:<type>"` so automated standby reuse cannot select it.
 - When add-phone soft retry is disabled, current capacity-first behavior treats `add_phone` as a hard managed-child blocker that may release the Team seat. Do not migrate target's pause-without-release behavior unless the operator policy is explicitly changed.
 - Target assertions that require persisted `"auth_pending"` or exact `update_account(email, {"status": ...})` calls are incompatible with the current account-state lifecycle and are not migration requirements.
@@ -171,6 +174,9 @@
 | repeated `email_verification` exhausts auth-repair retry budget | Pause repair, release the Team seat when present, and retire/disable the released local row under skip-reuse mode |
 | `login_state_lost` has no usable local auth file and blocks Team capacity | Pause repair, release the Team seat when present, and retire/disable the released local row under skip-reuse mode |
 | `login_state_lost` has a protected local credential auth file | Pause repair without releasing the Team seat or disabling the row |
+| `auth_error_discard` or another concrete auth failure hits a protected AutoTeam-managed child with a mail binding | Allow the protected replacement override, release the Team seat when present, and retire/disable the row under skip-reuse mode |
+| `auth_retry_paused` / `auth_retry_after` is present on a protected AutoTeam-managed child | Treat it as a replaceable pool blocker; do not let stale `protect_team_seat` block rotation |
+| the same auth-failure signal hits a protected manual/local credential row without mail binding | Preserve the seat; do not release or retire the row automatically |
 | `collect_runtime_resource_snapshot()` unexpectedly raises inside `/api/status` | Return a status response with a diagnostic `runtime_resources.error`; do not raise a 500 |
 | `/api/status?fast=true` is called while rotate/fill is running | Return account/resource snapshot without live quota probes and with bounded CLIProxy health metadata |
 | background task calls `bump_task_progress("stage")` repeatedly | Update task heartbeat and append/refresh a bounded stage history |
@@ -227,6 +233,8 @@
   - selected target `test_signup_flow_profiles.py` assertions may be used for lightweight OAuth helper parity, split-code target waits, session-bundle extraction, and explicit browser-login result wrapping. Full-file target parity is not required when the only failures are the rejected old positional `SignupProfile` constructor shape.
   - selected target `test_manager_auth_repair.py` assertions may be used for `_login_codex_with_result()` result-wrapper parity, `cmd_check(...force_auth_repair...)`, historical-low-quota network-error handling, and protected/released Team blocker behavior. Full-file target parity is not required while remaining failures describe target-only `"auth_pending"` persisted literals, exact `update_account()` call shape, or the rejected add-phone retry-disabled no-release policy.
   - current `tests/unit/test_round12_s3_cherry_pick.py::TestCmdCheckAuthRepairEntry` and `::TestRecordAuthRepairFailure` must cover the adapted current behavior.
+  - `tests/unit/test_round12_s3_cherry_pick.py::TestRecordAuthRepairFailure` must cover protected managed-child release and manual protected credential preservation.
+  - `tests/unit/test_manager_rotate.py::test_replaceable_pool_blocker_reason_reports_concrete_evidence` must cover protected managed-child blocker classification and manual protected credential exclusion.
 - Status endpoint integration: `tests/unit/test_api_status.py`
   - fast status skips live quota probes and uses bounded CLIProxy health reads.
   - active tasks record progress history from `bump_task_progress()`.

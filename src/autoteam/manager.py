@@ -265,6 +265,27 @@ AUTH_REPAIR_RELEASE_TEAM_BLOCKER_TYPES = frozenset(
         "auth_error_discard",
     }
 )
+AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES = frozenset(
+    {
+        "add_phone",
+        "human_verification",
+        "email_verification",
+        "workspace_selection",
+        "account_selection",
+        "login_state_lost",
+        "no_valid_organizations",
+        "missing_auth_file",
+        "auth_error_discard",
+        "unsupported_region",
+        "oauth_timeout",
+        "site_unavailable",
+        "token_exchange_failed",
+        "non_team_plan",
+        "auth_code_missing",
+        "login_failed",
+        "exception",
+    }
+)
 
 
 def _chatgpt_session_ready(chatgpt_api) -> bool:
@@ -424,6 +445,46 @@ def _is_protected_local_credential_seat(acc: dict | None) -> bool:
     if acc.get("status") in (STATUS_STANDBY, STATUS_AUTH_INVALID):
         return True
     return not _has_account_mail_binding(acc)
+
+
+def _can_replace_protected_managed_auth_failure(
+    acc: dict | None,
+    *,
+    error_type: str | None = None,
+    reason: str | None = None,
+    missing_auth: bool = False,
+) -> bool:
+    """Allow AutoTeam-managed child seats to be evicted despite stale protection flags."""
+    acc = acc or {}
+    if _is_main_account_email(acc.get("email")) or not _has_account_mail_binding(acc):
+        return False
+    signals = {
+        str(value or "").strip()
+        for value in (
+            error_type,
+            reason,
+            acc.get("auth_last_error"),
+            "missing_auth_file" if missing_auth else None,
+        )
+        if str(value or "").strip()
+    }
+    if acc.get("auth_retry_paused"):
+        signals.add("auth_retry_paused")
+    if acc.get("auth_retry_after"):
+        signals.add("auth_retry_after")
+    return bool(
+        signals
+        & (
+            AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES
+            | AUTH_REPAIR_RELEASE_TEAM_BLOCKER_TYPES
+            | {
+                "auth_error",
+                "auth_retry_paused",
+                "auth_retry_after",
+                "auth_retry_after_invalid",
+            }
+        )
+    )
 
 
 def _is_auth_repair_pending_status(status: str | None) -> bool:
@@ -601,7 +662,10 @@ def _replaceable_pool_blocker_reason(acc: dict | None, *, missing_auth: bool = F
     acc = acc or {}
     if _is_main_account_email(acc.get("email")) or is_account_disabled(acc):
         return None
-    if _is_protected_local_credential_seat(acc):
+    if _is_protected_local_credential_seat(acc) and not _can_replace_protected_managed_auth_failure(
+        acc,
+        missing_auth=missing_auth,
+    ):
         return None
     status = acc.get("status")
     if status == STATUS_EXHAUSTED:
@@ -873,6 +937,16 @@ def _auth_repair_skip_reason(acc: dict | None, *, force: bool = False, now: floa
     return None
 
 
+def _should_aggressively_release_auth_failure(error_type: str | None, *, discard_failed_repair: bool) -> bool:
+    """Return whether one-shot rotation should release a child seat for this login/link failure."""
+    if not discard_failed_repair:
+        return False
+    normalized = str(error_type or "").strip()
+    if not normalized:
+        normalized = "login_failed"
+    return normalized in AUTH_REPAIR_AGGRESSIVE_RELEASE_TYPES
+
+
 def _record_auth_repair_failure(
     email: str,
     error_type: str | None = None,
@@ -907,7 +981,18 @@ def _record_auth_repair_failure(
     except Exception:
         discard_failed_repair = True
 
-    if error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
+    if _should_aggressively_release_auth_failure(error_type, discard_failed_repair=discard_failed_repair):
+        prev_count = int(acc.get("auth_retry_count") or 0)
+        state = {
+            "auth_retry_count": prev_count + 1,
+            "auth_last_error": error_type,
+            "auth_last_error_detail": error_detail,
+            "auth_last_failed_at": now,
+            "auth_retry_after": None,
+            "auth_retry_paused": True,
+        }
+        release_team_seat = True
+    elif error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
         prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
         next_count = prev_count + 1
         max_retries = _auth_repair_add_phone_max_retries()
@@ -974,7 +1059,8 @@ def _record_auth_repair_failure(
             state["auth_retry_paused"] = True
             release_team_seat = True
 
-    if release_team_seat and protected_local_credential:
+    protected_replacement_override = _can_replace_protected_managed_auth_failure(acc, error_type=error_type)
+    if release_team_seat and protected_local_credential and not protected_replacement_override:
         logger.warning("[认证修复] 保留受保护的本地凭证席位: %s", email)
         release_team_seat = False
 
@@ -996,7 +1082,9 @@ def _record_auth_repair_failure(
     # 走 default_machine.transition 时映射到 AccountState.AUTH_PENDING.
     final_status = STATUS_STANDBY if seat_released or not is_team_member else STATUS_AUTH_INVALID
     update_account(email, status=final_status, _reason=f"auth_repair:{error_type}")
-    if discard_failed_repair and seat_released and not protected_local_credential:
+    if discard_failed_repair and final_status == STATUS_STANDBY and (
+        not protected_local_credential or protected_replacement_override
+    ):
         _discard_auth_repair_failed_account_record(
             email,
             f"auth_repair_failed:{error_type}",
@@ -1011,6 +1099,7 @@ def _record_auth_repair_failure(
         "release_attempted": release_attempted,
         "remove_status": remove_status,
         "protected_local_credential": protected_local_credential,
+        "protected_replacement_override": protected_replacement_override,
     }
 
 

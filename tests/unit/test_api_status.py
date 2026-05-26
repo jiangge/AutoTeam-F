@@ -767,6 +767,43 @@ def test_post_rotate_runs_final_sync_in_background(monkeypatch):
     assert rotate_calls == [((3,), {"force_auth_repair": True, "background_post_sync": True})]
 
 
+def test_post_fill_defers_sync_and_status_to_background(monkeypatch):
+    started = []
+    fill_calls = []
+    sync_calls = []
+
+    def fake_start_task(command, func, params, *args, **kwargs):
+        started.append((command, func, params, args, kwargs))
+        return {"task_id": "fill-task", "command": command, "params": params}
+
+    monkeypatch.setattr(api, "_start_task", fake_start_task)
+    monkeypatch.setattr(api._pw_executor, "run", lambda fn: (True, "ok", {}))
+    monkeypatch.setattr(
+        "autoteam.manager.cmd_fill",
+        lambda *args, **kwargs: fill_calls.append((args, kwargs)) or {"filled": True},
+    )
+    monkeypatch.setattr(
+        "autoteam.manager._schedule_post_task_sync",
+        lambda stage_label: sync_calls.append(stage_label),
+    )
+
+    result = api.post_fill(api.TaskParams(target=3))
+
+    assert result["task_id"] == "fill-task"
+    assert len(started) == 1
+    command, func, params, args, kwargs = started[0]
+    assert command == "fill"
+    assert params == {"target": 3, "leave_workspace": False}
+    assert args == (3,)
+    assert kwargs == {"leave_workspace": False}
+
+    assert func(3, leave_workspace=False) == {"filled": True}
+    assert fill_calls == [
+        ((3,), {"leave_workspace": False, "post_sync": False, "print_status": False})
+    ]
+    assert sync_calls == ["[填充]"]
+
+
 def test_disable_and_enable_account_toggle_local_flag(tmp_path, monkeypatch):
     accounts_file = tmp_path / "accounts.json"
     monkeypatch.setattr(accounts, "ACCOUNTS_FILE", accounts_file)

@@ -103,7 +103,9 @@ def test_cmd_rotate_can_defer_final_sync_when_running_as_api_task(monkeypatch):
     ]
 
 
-def test_replaceable_pool_blocker_reason_reports_concrete_evidence():
+def test_replaceable_pool_blocker_reason_reports_concrete_evidence(tmp_path):
+    auth_file = tmp_path / "codex-auth.json"
+    auth_file.write_text("{}", encoding="utf-8")
     assert (
         manager._replaceable_pool_blocker_reason(
             {"email": "missing@example.com", "status": manager.STATUS_ACTIVE, "auth_file": ""}
@@ -121,6 +123,31 @@ def test_replaceable_pool_blocker_reason_reports_concrete_evidence():
             {"email": "exhausted@example.com", "status": manager.STATUS_EXHAUSTED}
         )
         == "quota_exhausted"
+    )
+    assert (
+        manager._replaceable_pool_blocker_reason(
+            {
+                "email": "managed-protected@example.com",
+                "status": manager.STATUS_ACTIVE,
+                "auth_file": str(auth_file),
+                "mail_account_id": 1,
+                "auth_retry_paused": True,
+                "protect_team_seat": True,
+            }
+        )
+        == "auth_retry_paused"
+    )
+    assert (
+        manager._replaceable_pool_blocker_reason(
+            {
+                "email": "manual-protected@example.com",
+                "status": manager.STATUS_ACTIVE,
+                "auth_file": str(auth_file),
+                "auth_retry_paused": True,
+                "protect_team_seat": True,
+            }
+        )
+        is None
     )
 
 

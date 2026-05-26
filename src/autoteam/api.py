@@ -3450,7 +3450,12 @@ def post_fill(params: TaskParams = TaskParams()):
     则直接返回 409,不启动后台任务(队列化拒绝,Solution C)。本地状态足够用,无需启动
     Playwright 远程查询,避免给前端按错按钮带来额外开销。
     """
-    from autoteam.manager import TEAM_SUB_ACCOUNT_HARD_CAP, _count_local_team_seat_accounts, cmd_fill
+    from autoteam.manager import (
+        TEAM_SUB_ACCOUNT_HARD_CAP,
+        _count_local_team_seat_accounts,
+        _schedule_post_task_sync,
+        cmd_fill,
+    )
 
     if params.leave_workspace:
         from autoteam.accounts import load_accounts
@@ -3511,10 +3516,17 @@ def post_fill(params: TaskParams = TaskParams()):
         # probe 异常按 spec §6.1 不阻塞 — M-T1 / M-T2 在 _run_post_register_oauth 兜底
         pass
 
+    def _cmd_fill_api_task(target: int, *, leave_workspace: bool = False):
+        if leave_workspace:
+            return cmd_fill(target, leave_workspace=True)
+        result = cmd_fill(target, leave_workspace=False, post_sync=False, print_status=False)
+        _schedule_post_task_sync("[填充]")
+        return result
+
     command = "fill-personal" if params.leave_workspace else "fill"
     task = _start_task(
         command,
-        cmd_fill,
+        _cmd_fill_api_task,
         {"target": params.target, "leave_workspace": params.leave_workspace},
         params.target,
         leave_workspace=params.leave_workspace,

@@ -588,6 +588,7 @@ class TestRecordAuthRepairFailure:
     ):
         """普通错误 → 衰退式 retry_after, paused=False, status=AUTH_INVALID(留 team)。"""
         # Account is in team → final_status should be AUTH_INVALID
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", False)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
 
         result = manager_mod._record_auth_repair_failure(
@@ -636,6 +637,7 @@ class TestRecordAuthRepairFailure:
         self, seeded_account, monkeypatch
     ):
         """add_phone (软重试开 + 未超限) → paused=False + retry_after."""
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", False)
         monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
         monkeypatch.setenv("AUTO_CHECK_RETRY_ADD_PHONE", "1")
         monkeypatch.setenv("AUTO_CHECK_ADD_PHONE_MAX_RETRIES", "3")
@@ -739,6 +741,40 @@ class TestRecordAuthRepairFailure:
         assert acc["disabled"] is True
         assert acc["retired_reason"] == "auth_repair_failed:login_state_lost"
 
+    @pytest.mark.parametrize(
+        "error_type",
+        ["non_team_plan", "oauth_timeout", "auth_code_missing"],
+    )
+    def test_aggressive_login_link_failures_release_child(
+        self, seeded_account, monkeypatch, error_type
+    ):
+        """One-shot login/link failures should release managed child capacity under skip-reuse."""
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
+        monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
+        monkeypatch.setattr(
+            manager_mod,
+            "_release_auth_repair_team_seat",
+            lambda email, **kw: "removed",
+        )
+
+        result = manager_mod._record_auth_repair_failure(
+            seeded_account,
+            error_type=error_type,
+            error_detail="login/link failure",
+        )
+
+        assert result["auth_retry_count"] == 1
+        assert result["auth_retry_paused"] is True
+        assert result["auth_retry_after"] is None
+        assert result["release_attempted"] is True
+        assert result["seat_released"] is True
+        assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), seeded_account)
+        assert acc["disabled"] is True
+        assert acc["reuse_disabled"] is True
+        assert acc["retired_reason"] == f"auth_repair_failed:{error_type}"
+
     def test_login_state_lost_preserves_protected_local_credential(
         self, isolated_accounts, tmp_path, monkeypatch
     ):
@@ -775,6 +811,48 @@ class TestRecordAuthRepairFailure:
         acc = accounts_mod.find_account(accounts_mod.load_accounts(), "manual@example.com")
         assert acc["disabled"] is False
         assert acc.get("retired_reason") is None
+
+    def test_auth_error_releases_protected_managed_child(
+        self, isolated_accounts, tmp_path, monkeypatch
+    ):
+        """Managed child seats may be released even when stale protection flags remain."""
+        auth_file = tmp_path / "managed-seat.json"
+        auth_file.write_text("{}", encoding="utf-8")
+        accounts_mod.add_account("managed@example.com", "pwd")
+        accounts_mod.update_account(
+            "managed@example.com",
+            status=accounts_mod.STATUS_ACTIVE,
+            auth_file=str(auth_file),
+            mail_account_id=123,
+            protect_team_seat=True,
+        )
+        monkeypatch.setattr("autoteam.config.ROTATE_SKIP_REUSE", True)
+        monkeypatch.setattr(manager_mod, "_is_email_in_team", lambda email: True)
+        monkeypatch.setattr(manager_mod.time, "time", lambda: 1_700_000_000)
+        monkeypatch.setattr(
+            manager_mod,
+            "_release_auth_repair_team_seat",
+            lambda email, **kw: "removed",
+        )
+
+        result = manager_mod._record_auth_repair_failure(
+            "managed@example.com",
+            error_type="auth_error_discard",
+            error_detail="token invalid",
+        )
+
+        assert result["auth_retry_paused"] is True
+        assert result["protected_local_credential"] is True
+        assert result["protected_replacement_override"] is True
+        assert result["release_attempted"] is True
+        assert result["seat_released"] is True
+        assert result["status"] == accounts_mod.STATUS_STANDBY
+        acc = accounts_mod.find_account(accounts_mod.load_accounts(), "managed@example.com")
+        assert acc["status"] == accounts_mod.STATUS_STANDBY
+        assert acc["disabled"] is True
+        assert acc["reuse_disabled"] is True
+        assert acc["retired_at"] == 1_700_000_000
+        assert acc["retired_reason"] == "auth_repair_failed:auth_error_discard"
 
     def test_failure_when_not_in_team_lands_standby(
         self, seeded_account, monkeypatch
